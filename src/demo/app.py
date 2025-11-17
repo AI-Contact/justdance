@@ -130,8 +130,7 @@ active_session = {
     'matcher': None,
     'prev_live_emb': None,
     'prev_ref_emb': None,
-    'score_ema': 0.0,
-    'score_window': [],
+    'score_ema': 0.5,  # 초기값을 중간 점수로 설정 (0.5 = 50점 원본, 정규화 후 0점)
     'feedback': [],
     'ref_frame_cur': 0,
     'start_t': 0.0,
@@ -176,6 +175,13 @@ def _combine(left, right):
         right = cv2.resize(right, (int(rw * scale), h), interpolation=cv2.INTER_LINEAR)
     return np.hstack([left, right])
 
+def _normalize_score(score_ema):
+    """점수 정규화 (등급 판정과 동일한 방식)"""
+    # 50~95 -> 0~100 정규화
+    score_50_95 = score_ema * 100.0
+    normalized = ((score_50_95 - 50.0) / 45.0) * 100.0
+    return float(np.clip(normalized, 0.0, 100.0))
+
 def init_session(ref_path: str, ref_lm_path: str, ref_video_path: str):
     """세션 초기화 (웹캠 전용)"""
     with active_session['lock']:
@@ -212,8 +218,11 @@ def init_session(ref_path: str, ref_lm_path: str, ref_video_path: str):
         except Exception:
             rest_intervals = []
         try:
-            region_w, angle_w = load_weights_for_video(ref_video_path)
-        except Exception:
+            # weights.json 경로를 명시적으로 지정 (작업 디렉토리 변경으로 인한 문제 방지)
+            weights_json_path = str(SRC_DIR / 'data' / 'weights.json')
+            region_w, angle_w = load_weights_for_video(ref_video_path, weights_json_path)
+        except Exception as e:
+            print(f"[Warning] Failed to load weights for {os.path.basename(ref_video_path)}: {e}")
             region_w, angle_w = None, None
 
         # 웹캠 열기 (CONFIG에서 카메라 ID 사용)
@@ -244,8 +253,7 @@ def init_session(ref_path: str, ref_lm_path: str, ref_video_path: str):
             'matcher': OnlineMatcher(ref),
             'prev_live_emb': None,
             'prev_ref_emb': None,
-            'score_ema': 1.0,
-            'score_window': [],
+            'score_ema': 0.5,  # 초기값을 중간 점수로 설정 (0.5 = 50점 원본, 정규화 후 0점)
             'feedback': [],
             'ref_frame_cur': 0,
             'start_t': time.perf_counter(),
@@ -301,11 +309,18 @@ def generate_frames():
         is_warmup = warmup_elapsed < CONFIG['WARMUP_SEC']
         warmup_remaining = max(0, CONFIG['WARMUP_SEC'] - warmup_elapsed)
 
-        # Warmup 완료 시 start_t 재설정 (한 번만)
+        # Warmup 완료 시 start_t 재설정 및 레퍼런스 영상 시작 (한 번만)
         if not is_warmup and not active_session['warmup_done']:
             with active_session['lock']:
                 active_session['warmup_done'] = True
                 active_session['start_t'] = time.perf_counter()
+                # 등급 평가 시작 시점도 초기화 (Warmup 후부터 3초 카운트 시작)
+                active_session['last_grade_time'] = 0.0
+                active_session['grade_history'] = []
+                # 레퍼런스 영상을 처음으로 되돌림 (Warmup 동안 진행되지 않도록)
+                if ref_cap and ref_cap.isOpened():
+                    ref_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    active_session['ref_frame_cur'] = 0
 
         # Warmup 중에는 카운트다운만 표시
         if is_warmup:
@@ -410,64 +425,12 @@ def generate_frames():
                 )
             display_right = ref_frame if ok_ref else None
             combined = _combine(display_left, display_right)
-            # REST 텍스트를 CV에 표시하지 않음 (웹에서만 표시)
+            # REST 구간에서는 점수 계산 및 등급 평가 하지 않음
         else:
             with active_session['lock']:
                 active_session['is_rest'] = False
-            # 포즈 분석 (스켈레톤은 이미 그려짐)
-            if arr is not None:
 
-                lm = normalize_landmarks(arr.copy())
-                emb = pose_embedding(lm)
-                _, ref_idx = matcher.step_with_hint(emb, hint_idx=hint_idx, search_radius=CONFIG['SEARCH_RADIUS'])
-
-                # 가중치
-                try:
-                    if ref_lm is not None and ref_idx < len(ref_lm):
-                        w_feat, _, _ = build_static_feature_weights(
-                            BONES, ANGLE_TRIPLES, lm_for_vis=ref_lm[ref_idx],
-                            region_w=region_w, angle_w=angle_w
-                        )
-                    else:
-                        w_feat = build_static_feature_weights(BONES, ANGLE_TRIPLES, lm_for_vis=None)[0]
-                except Exception:
-                    w_feat = build_static_feature_weights(BONES, ANGLE_TRIPLES, lm_for_vis=None)[0]
-
-                # 점수 계산
-                static_sim = weighted_cosine(matcher.ref[ref_idx], emb, w_feat)
-                ref_emb = matcher.ref[ref_idx]
-
-                with active_session['lock']:
-                    if active_session['prev_live_emb'] is not None and active_session['prev_ref_emb'] is not None:
-                        d_live = emb - active_session['prev_live_emb']
-                        d_ref = ref_emb - active_session['prev_ref_emb']
-                        motion_sim = weighted_cosine(d_live, d_ref, w_feat)
-                    else:
-                        motion_sim = 0.0
-
-                    blended = static_sim
-                    score = ((blended + 1.0) * 0.5)
-                    active_session['score_ema'] = exp_moving_avg(
-                        active_session['score_ema'],
-                        score,
-                        alpha=CONFIG['SCORE_EMA_ALPHA']
-                    )
-                    active_session['prev_live_emb'] = emb
-                    active_session['prev_ref_emb'] = ref_emb
-
-                    # 피드백
-                    try:
-                        if ref_lm is not None and ref_idx < len(ref_lm):
-                            msgs = angle_feedback(
-                                lm,
-                                ref_lm[ref_idx],
-                                angle_tol_deg=CONFIG['ANGLE_TOLERANCE_DEG']
-                            )
-                            active_session['feedback'] = msgs if msgs else ['Good!']
-                    except Exception:
-                        pass
-
-            # 레퍼런스 프레임
+            # 레퍼런스 프레임 먼저 가져오기
             with active_session['lock']:
                 ok_ref, ref_frame, active_session['ref_frame_cur'] = read_frame_at(
                     ref_cap, hint_idx * ref_stride, active_session['ref_frame_cur']
@@ -475,64 +438,122 @@ def generate_frames():
             display_right = ref_frame if ok_ref else None
             combined = _combine(display_left, display_right)
 
-            # 점수/등급 계산 (live_play와 동일한 정규화)
-            with active_session['lock']:
-                # 롤링 평균(3초) 계산
-                active_session['score_window'].append(active_session['score_ema'])
-                # ref_fps 기준 3초 윈도우
-                if len(active_session['score_window']) > int(ref_fps * 3):
-                    active_session['score_window'].pop(0)
+            # 포즈 분석 및 점수 계산 (포즈가 감지되었을 때만)
+            if arr is not None:
+                # 디버깅: visibility 확인
+                avg_vis = np.mean(arr[:, 3])
+                critical_joints = [11, 12, 23, 24, 13, 14, 25, 26]
+                critical_vis = np.mean([arr[i, 3] for i in critical_joints if i < len(arr)])
 
-                avg_score = float(np.nan_to_num(
-                    np.mean(active_session['score_window']) if len(active_session['score_window']) > 0 else active_session['score_ema'],
-                    nan=0.0, posinf=1.0, neginf=0.0
-                ))
+                # 매우 낮은 visibility 체크 (옆모습 디버깅용)
+                if critical_vis < 0.25:
+                    print(f"[DEBUG] Low visibility detected - avg: {avg_vis:.2f}, critical: {critical_vis:.2f}")
 
-                # 50~95 -> 0~100 정규화
-                avg_50_95 = avg_score * 100.0
-                avg_pct = ((avg_50_95 - 50.0) / 45.0) * 100.0
-                # 0~100로 클립
-                avg_pct = float(np.clip(avg_pct, 0.0, 100.0))
+                lm = normalize_landmarks(arr.copy())
+                emb = pose_embedding(lm)
 
-                # 등급 판정 (정규화된 점수 기준)
-                grade = 'PERFECT' if avg_pct >= 65 else (
-                    'GOOD' if avg_pct >= 60 else 'BAD'
-                )
+                # 임베딩에 유효한 값이 있는지 확인
+                valid_ratio = np.sum(np.abs(emb) > 1e-6) / len(emb)
+                if valid_ratio < 0.15:  # 0.3 → 0.15로 낮춤 (옆모습 대응)
+                    print(f"[DEBUG] Very low valid embedding ratio: {valid_ratio:.2f}, skipping score calculation")
+                    # 유효한 임베딩이 너무 적으면 점수 계산 스킵
+                    combined = _combine(display_left, display_right)
+                else:
+                    # 옆모습 디버깅: 유효 임베딩 비율 출력
+                    if valid_ratio < 0.3:
+                        print(f"[DEBUG] Low but acceptable embedding ratio: {valid_ratio:.2f}, proceeding with score calculation")
+                    _, ref_idx = matcher.step_with_hint(emb, hint_idx=hint_idx, search_radius=CONFIG['SEARCH_RADIUS'])
 
-                current_time = time.time()
+                    # 가중치
+                    try:
+                        if ref_lm is not None and ref_idx < len(ref_lm):
+                            w_feat, _, _ = build_static_feature_weights(
+                                BONES, ANGLE_TRIPLES, lm_for_vis=ref_lm[ref_idx],
+                                region_w=region_w, angle_w=angle_w
+                            )
+                        else:
+                            w_feat = build_static_feature_weights(BONES, ANGLE_TRIPLES, lm_for_vis=None)[0]
+                    except Exception:
+                        w_feat = build_static_feature_weights(BONES, ANGLE_TRIPLES, lm_for_vis=None)[0]
 
-                # 매 프레임마다 등급을 히스토리에 추가
-                active_session['grade_history'].append((current_time, grade))
+                    # 점수 계산
+                    static_sim = weighted_cosine(matcher.ref[ref_idx], emb, w_feat)
+                    ref_emb = matcher.ref[ref_idx]
 
-                # 3초보다 오래된 히스토리 제거
-                grade_interval = 3.0
-                cutoff_time = current_time - grade_interval
-                active_session['grade_history'] = [
-                    (t, g) for t, g in active_session['grade_history'] if t > cutoff_time
-                ]
+                    with active_session['lock']:
+                        if active_session['prev_live_emb'] is not None and active_session['prev_ref_emb'] is not None:
+                            d_live = emb - active_session['prev_live_emb']
+                            d_ref = ref_emb - active_session['prev_ref_emb']
+                            motion_sim = weighted_cosine(d_live, d_ref, w_feat)
+                        else:
+                            motion_sim = 0.0
 
-                # 3초마다 한 번씩만 등급 평가
-                if elapsed - active_session['last_grade_time'] >= grade_interval:
-                    # 3초 동안의 히스토리에서 가장 많이 나온 등급 계산
-                    if active_session['grade_history']:
-                        from collections import Counter
-                        grade_counts_in_window = Counter(g for t, g in active_session['grade_history'])
-                        # 가장 많이 나온 등급 선택 (동점이면 PERFECT > GOOD > BAD 우선순위)
-                        most_common_grade = None
-                        max_count = 0
-                        for g in ['PERFECT', 'GOOD', 'BAD']:
-                            if grade_counts_in_window[g] > max_count:
-                                max_count = grade_counts_in_window[g]
-                                most_common_grade = g
+                        blended = static_sim
+                        score = ((blended + 1.0) * 0.5)
+                        active_session['score_ema'] = exp_moving_avg(
+                            active_session['score_ema'],
+                            score,
+                            alpha=CONFIG['SCORE_EMA_ALPHA']
+                        )
+                        active_session['prev_live_emb'] = emb
+                        active_session['prev_ref_emb'] = ref_emb
 
-                        if most_common_grade:
-                            active_session['grade_counts'][most_common_grade] += 1
-                            active_session['graded_total'] += 1
-                            active_session['last_grade_time'] = elapsed
-                            active_session['current_grade'] = most_common_grade
-                            active_session['grade_timestamp'] = current_time
-                            # 히스토리 클리어 (새로운 3초 시작)
-                            active_session['grade_history'] = []
+                        # 피드백
+                        try:
+                            if ref_lm is not None and ref_idx < len(ref_lm):
+                                msgs = angle_feedback(
+                                    lm,
+                                    ref_lm[ref_idx],
+                                    angle_tol_deg=CONFIG['ANGLE_TOLERANCE_DEG']
+                                )
+                                active_session['feedback'] = msgs if msgs else ['Good!']
+                        except Exception:
+                            pass
+
+                    # 점수/등급 계산 (포즈가 감지되었을 때만 히스토리에 추가)
+                    with active_session['lock']:
+                        # 현재 점수 정규화 (50~95 -> 0~100)
+                        score_50_95 = active_session['score_ema'] * 100.0
+                        normalized_score = ((score_50_95 - 50.0) / 45.0) * 100.0
+                        normalized_score = float(np.clip(normalized_score, 0.0, 100.0))
+
+                        current_time = time.time()
+
+                        # 매 프레임마다 정규화된 점수를 히스토리에 추가
+                        active_session['grade_history'].append((current_time, normalized_score))
+
+                        # 3초보다 오래된 히스토리 제거
+                        grade_interval = 3.0
+                        cutoff_time = current_time - grade_interval
+                        active_session['grade_history'] = [
+                            (t, score) for t, score in active_session['grade_history'] if t > cutoff_time
+                        ]
+
+                        # 3초마다 한 번씩만 등급 평가
+                        if elapsed - active_session['last_grade_time'] >= grade_interval:
+                            # 3초 동안의 점수 히스토리에서 평균 점수 계산
+                            if active_session['grade_history']:
+                                avg_score = np.mean([score for t, score in active_session['grade_history']])
+
+                                # 평균 점수로 등급 판정
+                                if avg_score >= 65.0:
+                                    final_grade = 'PERFECT'
+                                elif avg_score >= 60.0:
+                                    final_grade = 'GOOD'
+                                else:
+                                    final_grade = 'BAD'
+
+                                active_session['grade_counts'][final_grade] += 1
+                                active_session['graded_total'] += 1
+                                active_session['last_grade_time'] = elapsed
+                                active_session['current_grade'] = final_grade
+                                active_session['grade_timestamp'] = current_time
+                                # 히스토리 클리어 (새로운 3초 시작)
+                                active_session['grade_history'] = []
+            else:
+                # 포즈가 감지되지 않은 경우
+                print("[DEBUG] No pose detected (arr is None)")
+                combined = _combine(display_left, display_right)
 
 
         # JPEG 인코딩 (CONFIG 품질 사용)
@@ -652,7 +673,7 @@ def get_status():
 
         response = {
             'is_running': active_session['is_running'],
-            'score': active_session['score_ema'] * 100.0 if active_session['score_ema'] else 0.0,
+            'score': _normalize_score(active_session['score_ema']) if active_session['score_ema'] is not None else 0.0,
             'is_warmup': is_warmup,
             'warmup_remaining': warmup_remaining,
             'is_rest': active_session['is_rest'],
@@ -700,5 +721,5 @@ def get_ref_video():
     )
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5001)), debug=True, threaded=True, use_reloader=False)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5002)), debug=True, threaded=True, use_reloader=False)
 

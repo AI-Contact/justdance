@@ -61,7 +61,8 @@ ANGLE_TRIPLES = [
 ]
 
 def _safe_get_xy(landmarks, idx):
-    if landmarks[idx, 3] < 0.5:
+    # 옆모습에서도 점수 계산이 가능하도록 임계값을 0.2로 낮춤
+    if landmarks[idx, 3] < 0.15:
         return None
     return landmarks[idx, :2]
 
