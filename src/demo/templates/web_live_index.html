@@ -317,7 +317,6 @@
             <span class="status-item">🏆 PERFECT: <span id="perfectCount">0</span></span>
             <span class="status-item">✅ GOOD: <span id="goodCount">0</span></span>
             <span class="status-item">❌ BAD: <span id="badCount">0</span></span>
-            <span class="status-item">총 평가: <span id="totalGraded">0</span>회</span>
         </div>
 
         <div class="video-container" id="videoContainer">
@@ -334,19 +333,15 @@
             <div class="grade-breakdown">
                 <div class="grade-item">
                     <span>🏆 PERFECT</span>
-                    <span id="finalPerfect">0 (0%)</span>
+                    <span id="finalPerfect">0%</span>
                 </div>
                 <div class="grade-item">
                     <span>✅ GOOD</span>
-                    <span id="finalGood">0 (0%)</span>
+                    <span id="finalGood">0%</span>
                 </div>
-                <div class="grade-item">
+                <div class="grade-item" style="border-bottom: none;">
                     <span>❌ BAD</span>
-                    <span id="finalBad">0 (0%)</span>
-                </div>
-                <div class="grade-item" style="border-bottom: none; font-weight: bold;">
-                    <span>총 평가</span>
-                    <span id="finalTotal">0회</span>
+                    <span id="finalBad">0%</span>
                 </div>
             </div>
             <button class="btn btn-primary" onclick="closeResultModal()" style="margin-top: 20px;">확인</button>
@@ -583,7 +578,6 @@
                     document.getElementById('perfectCount').textContent = data.grade_counts.PERFECT || 0;
                     document.getElementById('goodCount').textContent = data.grade_counts.GOOD || 0;
                     document.getElementById('badCount').textContent = data.grade_counts.BAD || 0;
-                    document.getElementById('totalGraded').textContent = data.graded_total;
                 }
 
                 // 새로운 등급이 매겨졌을 때만 일시적으로 표시 (2초)
@@ -697,7 +691,6 @@
             document.getElementById('finalPerfect').textContent = `${(pCnt/total*100).toFixed(1)}%`;
             document.getElementById('finalGood').textContent = `${(gCnt/total*100).toFixed(1)}%`;
             document.getElementById('finalBad').textContent = `${(bCnt/total*100).toFixed(1)}%`;
-            document.getElementById('finalTotal').textContent = `${total}회`;
 
             // 등급 통계바도 표시
             document.getElementById('gradeStatsBar').style.display = 'block';
