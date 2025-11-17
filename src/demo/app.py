@@ -1,245 +1,732 @@
 """
-Flask 기반 Pose Comparison 웹 데모 (실시간 웹 소켓 제거 버전)
+app.py
+
+웹에서 웹캠과 레퍼런스 영상을 실시간으로 비교하여 보여주는 Flask 앱.
+기존 pipeline 함수(live_play)의 기본 설정을 유지하면서 브라우저에서 시각화.
+
+사용법:
+  python3 src/demo/app.py
+  브라우저: http://localhost:5001
 """
+from __future__ import annotations
 
 import os
 import sys
 import time
 import uuid
-import tempfile
+import threading
 from pathlib import Path
-import subprocess
 
-# 상위 디렉터리를 Python 경로에 추가하여 pipeline 모듈을 찾을 수 있도록 함
-demo_dir = Path(__file__).parent
-project_root = demo_dir.parent  # src 디렉터리
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-# pipeline이 내부에서 data/* 상대경로를 사용하므로 CWD를 src로 변경
-try:
-    os.chdir(project_root)
-except Exception:
-    pass
-
-from flask import (
-    Flask,
-    flash,
-    redirect,
-    render_template,
-    request,
-    send_from_directory,
-    url_for,
-)
+import cv2
+import numpy as np
+from flask import Flask, render_template, Response, jsonify, request
+from flask_cors import CORS
 from werkzeug.utils import secure_filename
-from werkzeug.exceptions import RequestEntityTooLarge
 
-# compare_videos는 사용하지 않으므로 임포트 제거
-# from pipeline import compare_videos
+# 경로 설정
+CUR_DIR = Path(__file__).resolve().parent
+SRC_DIR = CUR_DIR.parent
+ROOT_DIR = SRC_DIR.parent
 
-# 기본 디렉터리 설정
-TEMP_DIR = Path(tempfile.gettempdir())
-UPLOAD_DIR = TEMP_DIR / "pose_demo_uploads"
-OUTPUT_DIR = TEMP_DIR / "pose_demo_outputs"
-for directory in (UPLOAD_DIR, OUTPUT_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
+# sys.path에 SRC_DIR 추가
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
-ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-ALLOWED_NPY_EXTS = {".npy"}
-ALLOWED_JSON_EXTS = {".json"}
+# 작업 디렉토리를 ROOT_DIR로 변경 (data/ 등 접근을 위해)
+try:
+    os.chdir(ROOT_DIR)
+except Exception as e:
+    print(f"Warning: Could not change directory to {ROOT_DIR}: {e}")
+    # SRC_DIR로 fallback
+    try:
+        os.chdir(SRC_DIR)
+    except Exception:
+        pass
+
+# Pipeline 임포트 (최소 인자 사용)
+from pipeline import (
+    PoseExtractor, OnlineMatcher, read_frame_at,
+    draw_colored_skeleton, normalize_landmarks, pose_embedding, angle_feedback,
+    BONES, ANGLE_TRIPLES,
+)
+from pipeline.similarity import (
+    build_static_feature_weights, weighted_cosine, exp_moving_avg, load_weights_for_video
+)
+from pipeline import load_rest_intervals_json, in_intervals
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("POSE_DEMO_SECRET_KEY", "pose-demo-dev-secret")
-# 대용량 업로드 허용 상향 (1GB)
-app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024
+CORS(app)
+app.config['SECRET_KEY'] = os.environ.get('WEB_LIVE_DEMO_SECRET', 'web-live-demo-secret')
+app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024 * 1024  # 1GB
 
+# 업로드 디렉터리
+TEMP_DIR = Path(os.getenv('TMPDIR', '/tmp'))
+UPLOAD_DIR = TEMP_DIR / 'web_live_demo_uploads'
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-@app.errorhandler(RequestEntityTooLarge)
-def handle_file_too_large(e):
-    """업로드 용량 초과 시 사용자에게 안내하고 홈으로 이동"""
-    flash("Request Entity Too Large: 업로드 파일이 너무 큽니다. 더 작은 파일을 업로드하거나 파일 길이를 줄여주세요.", "error")
-    return redirect(url_for("index"))
+ALLOWED_VIDEO = {'.mp4', '.mov', '.avi', '.mkv', '.webm'}
+ALLOWED_NPY = {'.npy'}
 
+# ============================================================
+# 설정 섹션 (여기서 기본값을 수정하세요)
+# ============================================================
+CONFIG = {
+    # 웹캠 설정
+    'CAMERA_ID': 0,  # 0: 기본 웹캠, 1: 외장 웹캠
 
-def cleanup_old_files(max_age_hours: int = 6) -> None:
-    """임시 파일 디렉터리에서 오래된 파일을 정리한다."""
-    cutoff = time.time() - max_age_hours * 3600
-    for directory in (UPLOAD_DIR, OUTPUT_DIR):
-        for path in directory.glob("*"):
-            try:
-                if path.is_file() and path.stat().st_mtime < cutoff:
-                    path.unlink()
-            except FileNotFoundError:
-                continue
+    # 레퍼런스 영상 재생 설정
+    'REF_FPS': 30.0,  # 레퍼런스 영상 기본 FPS (실제 영상 FPS로 자동 조정됨)
+    'REF_STRIDE': 2,  # 레퍼런스 프레임 stride (1: 모든 프레임, 2: 1프레임 건너뛰기)
 
+    # 점수 계산 설정
+    'SCORE_EMA_ALPHA': 0.95,  # EMA(지수이동평균) 알파값 (0.0~1.0, 높을수록 최근 값에 민감)
 
-def allowed_file(filename: str, file_type: str = "video") -> bool:
-    """파일 확장자 검증"""
-    if file_type == "video":
-        return Path(filename).suffix.lower() in ALLOWED_VIDEO_EXTS
-    elif file_type == "npy":
-        return Path(filename).suffix.lower() in ALLOWED_NPY_EXTS
-    elif file_type == "json":
-        return Path(filename).suffix.lower() in ALLOWED_JSON_EXTS
+    # 피드백 설정
+    'ANGLE_TOLERANCE_DEG': 10.0,  # 각도 피드백 허용 오차 (도 단위)
+
+    # 포즈 추출 설정
+    'POSE_MODEL_COMPLEXITY': 1,  # MediaPipe 모델 복잡도 (0: Lite, 1: Full, 2: Heavy)
+    'STATIC_IMAGE_MODE': False,  # 정적 이미지 모드 (False: 비디오 모드)
+
+    # 매칭 설정
+    'SEARCH_RADIUS': 0,  # 온라인 매칭 검색 반경 (0: hint_idx만 사용)
+
+    # REST 구간 설정
+    'REST_JSON_PATH': 'src/data/rest_exc.json',  # REST 구간 JSON 파일 경로
+
+    # 프레임 레이트 설정
+    'WEBCAM_FPS': 30,  # 웹캠 스트리밍 FPS
+
+    # JPEG 인코딩 품질
+    'JPEG_QUALITY': 75,  # JPEG 압축 품질 (1~100, 높을수록 고품질)
+
+    # 점수 등급 기준 (정규화된 점수 기준)
+    'GRADE_PERFECT_THRESHOLD': 65.0,  # PERFECT 등급 최소 점수 (정규화 후)
+    'GRADE_GOOD_THRESHOLD': 60.0,     # GOOD 등급 최소 점수 (정규화 후)
+
+    # Warmup 설정
+    'WARMUP_SEC': 5.0,  # 운동 시작 전 준비 시간 (초)
+    'COUNTDOWN_BEEP': True,  # 카운트다운 비프음 활성화
+}
+# ============================================================
+
+# 세션 상태 저장소 (웹캠 전용)
+active_session = {
+    'is_running': False,
+    'ref_path': None,
+    'ref_lm_path': None,
+    'ref_video_path': None,
+    'ref': None,
+    'ref_lm': None,
+    'ref_cap': None,
+    'webcam_cap': None,
+    'ref_fps': CONFIG['REF_FPS'],
+    'ref_stride': CONFIG['REF_STRIDE'],
+    'step_sec': 0.0,
+    'rest_intervals': [],
+    'region_w': None,
+    'angle_w': None,
+    'pe': None,
+    'matcher': None,
+    'prev_live_emb': None,
+    'prev_ref_emb': None,
+    'score_ema': 0.0,
+    'score_window': [],
+    'feedback': [],
+    'ref_frame_cur': 0,
+    'start_t': 0.0,
+    'warmup_start_t': 0.0,  # warmup 시작 시간
+    'warmup_done': False,    # warmup 완료 여부
+    'last_beep_sec': None,   # 마지막 비프음 재생 초
+    'grade_counts': {'PERFECT': 0, 'GOOD': 0, 'BAD': 0},  # 등급 카운트
+    'graded_total': 0,       # 총 등급 매긴 횟수
+    'last_grade_time': 0.0,  # 마지막으로 등급을 매긴 시간
+    'current_grade': None,   # 현재 등급
+    'grade_timestamp': 0.0,  # 등급 표시 시작 시간
+    'grade_history': [],     # 3초간 등급 히스토리 [(timestamp, grade), ...]
+    'final_rank': None,      # 최종 랭크 (S-F)
+    'session_ended': False,  # 세션 종료 여부
+    'end_time': 0.0,         # 세션 종료 시간
+    'frame_buffer': None,  # 최신 합성 프레임
+    'lock': threading.Lock(),
+}
+
+def _ext_ok(name: str, kind: str) -> bool:
+    ext = Path(name).suffix.lower()
+    if kind == 'video':
+        return ext in ALLOWED_VIDEO
+    if kind == 'npy':
+        return ext in ALLOWED_NPY
     return False
 
+def _save(fs, d: Path) -> Path:
+    p = d / secure_filename(fs.filename)
+    fs.save(str(p))
+    return p
 
-def parse_float(value: str, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+def _combine(left, right):
+    """좌우 프레임 합성"""
+    if right is None:
+        return left
+    h, w = left.shape[:2]
+    rh, rw = right.shape[:2]
+    if rh != h:
+        scale = h / float(rh)
+        right = cv2.resize(right, (int(rw * scale), h), interpolation=cv2.INTER_LINEAR)
+    return np.hstack([left, right])
 
+def init_session(ref_path: str, ref_lm_path: str, ref_video_path: str):
+    """세션 초기화 (웹캠 전용)"""
+    with active_session['lock']:
+        # 기존 리소스 정리
+        if active_session['ref_cap']:
+            active_session['ref_cap'].release()
+        if active_session['webcam_cap']:
+            active_session['webcam_cap'].release()
 
-def parse_int(value: str, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+        # 레퍼런스 로드
+        ref = np.load(ref_path, allow_pickle=True)
+        ref_lm = np.load(ref_lm_path, allow_pickle=True)
+        ref_cap = cv2.VideoCapture(ref_video_path)
 
+        # 레퍼런스 영상 FPS 추출 (실제 영상 FPS 우선, 없으면 CONFIG 기본값)
+        ref_fps = CONFIG['REF_FPS']
+        if ref_cap.isOpened():
+            fps_val = ref_cap.get(cv2.CAP_PROP_FPS)
+            if fps_val and fps_val > 1e-3:
+                ref_fps = float(fps_val)
 
-@app.before_request
-def before_request_cleanup() -> None:
-    cleanup_old_files()
+        ref_stride = CONFIG['REF_STRIDE']
+        rtf = 1.0
+        step_sec = ref_stride / (ref_fps * max(1e-6, rtf))
 
+        # REST 구간 / 가중치
+        try:
+            rest_intervals = load_rest_intervals_json(
+                CONFIG['REST_JSON_PATH'],
+                os.path.basename(ref_video_path),
+                ref_fps,
+                ref_stride
+            )
+        except Exception:
+            rest_intervals = []
+        try:
+            region_w, angle_w = load_weights_for_video(ref_video_path)
+        except Exception:
+            region_w, angle_w = None, None
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    if request.method == "POST":
-        # 필수 파일 업로드 검증 (레퍼런스 임베딩/랜드마크/레퍼런스 영상은 필수)
-        ref_file = request.files.get("ref_embedding")
-        if ref_file is None or ref_file.filename == "":
-            flash("레퍼런스 임베딩(.npy) 파일을 업로드해주세요.", "error")
-            return redirect(url_for("index"))
-        if not allowed_file(ref_file.filename, "npy"):
-            flash("레퍼런스 임베딩은 .npy 파일만 업로드 가능합니다.", "error")
-            return redirect(url_for("index"))
+        # 웹캠 열기 (CONFIG에서 카메라 ID 사용)
+        webcam_cap = cv2.VideoCapture(CONFIG['CAMERA_ID'])
+        if not webcam_cap.isOpened():
+            raise RuntimeError(f'Failed to open webcam (CAMERA_ID={CONFIG["CAMERA_ID"]})')
 
-        ref_lm_file = request.files.get("ref_landmarks")
-        if ref_lm_file is None or ref_lm_file.filename == "":
-            flash("레퍼런스 랜드마크(.npy) 파일을 업로드해주세요.", "error")
-            return redirect(url_for("index"))
-        if not allowed_file(ref_lm_file.filename, "npy"):
-            flash("레퍼런스 랜드마크는 .npy 파일만 업로드 가능합니다.", "error")
-            return redirect(url_for("index"))
+        # 세션 업데이트
+        active_session.update({
+            'is_running': True,
+            'ref_path': ref_path,
+            'ref_lm_path': ref_lm_path,
+            'ref_video_path': ref_video_path,
+            'ref': ref,
+            'ref_lm': ref_lm,
+            'ref_cap': ref_cap,
+            'webcam_cap': webcam_cap,
+            'ref_fps': ref_fps,
+            'ref_stride': ref_stride,
+            'step_sec': step_sec,
+            'rest_intervals': rest_intervals,
+            'region_w': region_w,
+            'angle_w': angle_w,
+            'pe': PoseExtractor(
+                static_image_mode=CONFIG['STATIC_IMAGE_MODE'],
+                model_complexity=CONFIG['POSE_MODEL_COMPLEXITY']
+            ),
+            'matcher': OnlineMatcher(ref),
+            'prev_live_emb': None,
+            'prev_ref_emb': None,
+            'score_ema': 1.0,
+            'score_window': [],
+            'feedback': [],
+            'ref_frame_cur': 0,
+            'start_t': time.perf_counter(),
+            'warmup_start_t': time.perf_counter(),  # warmup 시작 시간
+            'warmup_done': False,                    # warmup 상태
+            'last_beep_sec': None,                   # 비프음 상태 초기화
+            'grade_counts': {'PERFECT': 0, 'GOOD': 0, 'BAD': 0},
+            'graded_total': 0,
+            'last_grade_time': 0.0,
+            'current_grade': None,
+            'grade_timestamp': 0.0,
+            'grade_history': [],
+            'final_rank': None,
+            'session_ended': False,
+            'end_time': 0.0,
+            'frame_buffer': None,
+        })
 
-        ref_video_file = request.files.get("ref_video")
-        if ref_video_file is None or ref_video_file.filename == "":
-            flash("레퍼런스 영상 파일(.mp4 등)을 업로드해주세요.", "error")
-            return redirect(url_for("index"))
-        if not allowed_file(ref_video_file.filename, "video"):
-            flash("레퍼런스 영상은 동영상 파일만 업로드 가능합니다.", "error")
-            return redirect(url_for("index"))
+def generate_frames():
+    """프레임 생성 (MJPEG 스트리밍) - 웹캠 전용"""
+    font = cv2.FONT_HERSHEY_SIMPLEX
 
-        # 사용자 영상은 선택 (없으면 별도 프로세스 live_play 실행)
-        user_file = request.files.get("user_video")
-        user_has_video = bool(user_file and user_file.filename and allowed_file(user_file.filename, "video"))
+    while True:
+        with active_session['lock']:
+            if not active_session['is_running']:
+                break
 
-        # 선택적 REST JSON
-        rest_json_file = request.files.get("rest_json")
+            webcam_cap = active_session['webcam_cap']
+            ref_cap = active_session['ref_cap']
+            pe = active_session['pe']
+            matcher = active_session['matcher']
+            ref = active_session['ref']
+            ref_lm = active_session['ref_lm']
+            ref_stride = active_session['ref_stride']
+            step_sec = active_session['step_sec']
+            ref_fps = active_session['ref_fps']
+            rest_intervals = active_session['rest_intervals']
+            region_w = active_session['region_w']
+            angle_w = active_session['angle_w']
 
-        # 요청별 디렉터리 생성(원본 파일명 유지)
-        req_id = uuid.uuid4().hex
-        req_dir = UPLOAD_DIR / req_id
-        req_dir.mkdir(parents=True, exist_ok=True)
+            if not webcam_cap or not ref_cap:
+                break
 
-        # 파일 저장
-        ref_path = req_dir / secure_filename(ref_file.filename)
-        ref_file.save(str(ref_path))
-        ref_lm_path = req_dir / secure_filename(ref_lm_file.filename)
-        ref_lm_file.save(str(ref_lm_path))
-        ref_video_path = req_dir / secure_filename(ref_video_file.filename)
-        ref_video_file.save(str(ref_video_path))
+            # 웹캠 프레임 읽기
+            ret_webcam, webcam_frame = webcam_cap.read()
+            if not ret_webcam:
+                # 웹캠 재시도
+                continue
 
-        user_path = None
-        if user_has_video:
-            user_path = req_dir / secure_filename(user_file.filename)
-            user_file.save(str(user_path))
-        elif user_file and user_file.filename and not allowed_file(user_file.filename, "video"):
-            flash("지원하지 않는 사용자 동영상 형식입니다.", "error")
-            try:
-                for p in [ref_path, ref_lm_path, ref_video_path]:
-                    Path(p).unlink(missing_ok=True)
-                req_dir.rmdir()
-            except Exception:
-                pass
-            return redirect(url_for("index"))
+        # Warmup 체크
+        warmup_elapsed = time.perf_counter() - active_session['warmup_start_t']
+        is_warmup = warmup_elapsed < CONFIG['WARMUP_SEC']
+        warmup_remaining = max(0, CONFIG['WARMUP_SEC'] - warmup_elapsed)
 
-        rest_json_path = None
-        if rest_json_file and rest_json_file.filename:
-            if not allowed_file(rest_json_file.filename, "json"):
-                flash("REST JSON은 .json 파일만 업로드 가능합니다.", "error")
-                try:
-                    for p in [ref_path, ref_lm_path, ref_video_path, user_path]:
-                        if p:
-                            Path(p).unlink(missing_ok=True)
-                    req_dir.rmdir()
-                except Exception:
-                    pass
-                return redirect(url_for("index"))
-            rest_json_path = req_dir / secure_filename(rest_json_file.filename)
-            rest_json_file.save(str(rest_json_path))
+        # Warmup 완료 시 start_t 재설정 (한 번만)
+        if not is_warmup and not active_session['warmup_done']:
+            with active_session['lock']:
+                active_session['warmup_done'] = True
+                active_session['start_t'] = time.perf_counter()
 
-        if user_has_video and user_path is not None:
-            # 비교 모드: out_video 생성 없이 즉시 비교 화면(OpenCV 창) 표시
-            cmd = [
-                sys.executable,
-                str(demo_dir / "run_compare.py"),
-                "--ref", str(ref_path),
-                "--ref-lm", str(ref_lm_path),
-                "--user-video", str(user_path),
-                "--ref-video", str(ref_video_path),
-            ]
-            try:
-                subprocess.Popen(cmd)
-            except Exception as exc:
-                flash(f"비교 세션 시작 실패: {exc}", "error")
-                # 업로드 정리(최소한의 롤백)
-                try:
-                    for p in [ref_path, ref_lm_path, ref_video_path, user_path, rest_json_path]:
-                        if p:
-                            Path(p).unlink(missing_ok=True)
-                    req_dir.rmdir()
-                except Exception:
-                    pass
-                return redirect(url_for("index"))
+        # Warmup 중에는 카운트다운만 표시
+        if is_warmup:
+            display_left = webcam_frame.copy()
 
-            flash("비교가 시작되었습니다. OpenCV 창에서 결과를 확인하세요 (종료: ESC/q)", "success")
-            # 업로드 파일은 비교 프로세스에서 사용하므로 즉시 삭제하지 않음(주기 정리에 맡김)
-            return redirect(url_for("index"))
+            # 레퍼런스 첫 프레임 표시
+            with active_session['lock']:
+                ref_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok_ref, ref_frame = ref_cap.read()
+                active_session['ref_frame_cur'] = 0
+
+            display_right = ref_frame if ok_ref else None
+            combined = _combine(display_left, display_right)
+
+            # 카운트다운 표시
+            countdown_text = f"Ready... {int(warmup_remaining) + 1}"
+            cv2.putText(combined, countdown_text, (20, 60), font, 1.5, (0, 215, 255), 3, cv2.LINE_AA)
+            cv2.putText(combined, "WARMUP", (20, 120), font, 1.0, (0, 215, 255), 2, cv2.LINE_AA)
+
+            if display_right is not None:
+                cv2.putText(combined, "REFERENCE (Start Soon)",
+                           (display_left.shape[1] + 20, 60), font, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # JPEG 인코딩
+            ret, buffer = cv2.imencode('.jpg', combined, [int(cv2.IMWRITE_JPEG_QUALITY), CONFIG['JPEG_QUALITY']])
+            if ret:
+                with active_session['lock']:
+                    active_session['frame_buffer'] = combined
+                frame_bytes = buffer.tobytes()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+            time.sleep(1 / CONFIG['WEBCAM_FPS'])
+            continue
+
+        # 동기 인덱스 계산 (warmup 완료 후부터)
+        elapsed = time.perf_counter() - active_session['start_t']
+        hint_idx = int(elapsed / step_sec)
+        hint_idx = min(hint_idx, ref.shape[0] - 1)
+        if ref_lm is not None:
+            hint_idx = min(hint_idx, len(ref_lm) - 1)
+
+        # ref 영상 종료 체크 (마지막 10프레임 이내)
+        is_near_end = hint_idx >= ref.shape[0] - 10
+
+        if is_near_end and not active_session.get('session_ended', False):
+            with active_session['lock']:
+                # 최종 랭크 계산 (한 번만 실행)
+                graded_total = active_session['graded_total']
+                if graded_total > 0 and active_session.get('final_rank') is None:
+                    p_cnt = active_session['grade_counts']['PERFECT']
+                    g_cnt = active_session['grade_counts']['GOOD']
+                    b_cnt = active_session['grade_counts']['BAD']
+                    p_ratio = p_cnt / graded_total
+                    pg_ratio = (p_cnt + g_cnt) / graded_total
+
+                    # 랭크 규칙 (live_play와 동일)
+                    if p_ratio >= 0.70:
+                        final_rank = "S"
+                    elif p_ratio >= 0.50 or pg_ratio >= 0.85:
+                        final_rank = "A"
+                    elif pg_ratio >= 0.70:
+                        final_rank = "B"
+                    elif pg_ratio >= 0.50:
+                        final_rank = "C"
+                    else:
+                        final_rank = "F"
+
+                    active_session['final_rank'] = final_rank
+                    active_session['session_ended'] = True
+                    active_session['end_time'] = time.perf_counter()
+
+                    print("\n===== WEB LIVE PLAY SUMMARY =====")
+                    print(f"Graded: {graded_total}")
+                    print(f"PERFECT: {p_cnt} ({p_ratio*100:.1f}%)")
+                    print(f"GOOD   : {g_cnt} ({(g_cnt/graded_total)*100:.1f}%)")
+                    print(f"BAD    : {b_cnt} ({(b_cnt/graded_total)*100:.1f}%)")
+                    print(f"FINAL RANK: {final_rank}")
+
+        # session_ended 후에도 5초간 결과 화면 표시
+        if active_session.get('session_ended', False):
+            elapsed_since_end = time.perf_counter() - active_session.get('end_time', 0)
+
+            # 5초 후 세션 종료
+            if elapsed_since_end >= 5.0:
+                with active_session['lock']:
+                    active_session['is_running'] = False
+                break
+
+            # 결과 화면 생성
+            display_left = webcam_frame.copy()
+
+            # 레퍼런스 마지막 프레임
+            with active_session['lock']:
+                if ref_cap.isOpened():
+                    total_frames = int(ref_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    ref_cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 1))
+                    ok_ref, ref_frame = ref_cap.read()
+                else:
+                    ok_ref = False
+
+            display_right = ref_frame if ok_ref else None
+            combined = _combine(display_left, display_right)
+
+            # 최종 결과 오버레이
+            overlay = combined.copy()
+            cv2.rectangle(overlay, (0, 0), (combined.shape[1], combined.shape[0]), (0, 0, 0), -1)
+            combined = cv2.addWeighted(overlay, 0.7, combined, 0.3, 0)
+
+            y = 150
+            final_rank = active_session.get('final_rank', 'F')
+            rank_color = (0, 255, 0) if final_rank in ['S', 'A'] else ((0, 200, 255) if final_rank == 'B' else (255, 200, 0) if final_rank == 'C' else (255, 0, 0))
+
+            cv2.putText(combined, "SESSION ENDED", (combined.shape[1]//2 - 200, y), font, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
+            y += 80
+            cv2.putText(combined, f"FINAL RANK: {final_rank}", (combined.shape[1]//2 - 180, y), font, 2.0, rank_color, 4, cv2.LINE_AA)
+            y += 80
+
+            graded_total = active_session['graded_total']
+            if graded_total > 0:
+                p_cnt = active_session['grade_counts']['PERFECT']
+                g_cnt = active_session['grade_counts']['GOOD']
+                b_cnt = active_session['grade_counts']['BAD']
+
+                cv2.putText(combined, f"PERFECT: {p_cnt} ({(p_cnt/graded_total)*100:.1f}%)", (combined.shape[1]//2 - 180, y), font, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
+                y += 40
+                cv2.putText(combined, f"GOOD   : {g_cnt} ({(g_cnt/graded_total)*100:.1f}%)", (combined.shape[1]//2 - 180, y), font, 1.0, (0, 200, 255), 2, cv2.LINE_AA)
+                y += 40
+                cv2.putText(combined, f"BAD    : {b_cnt} ({(b_cnt/graded_total)*100:.1f}%)", (combined.shape[1]//2 - 180, y), font, 1.0, (255, 0, 0), 2, cv2.LINE_AA)
+
+            # JPEG 인코딩 및 전송
+            ret, buffer = cv2.imencode('.jpg', combined, [int(cv2.IMWRITE_JPEG_QUALITY), CONFIG['JPEG_QUALITY']])
+            if ret:
+                with active_session['lock']:
+                    active_session['frame_buffer'] = combined
+                frame_bytes = buffer.tobytes()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+            time.sleep(1 / CONFIG['WEBCAM_FPS'])
+            continue
+
+        display_left = webcam_frame.copy()
+
+        # 포즈 추론 (항상 수행하여 스켈레톤 그리기)
+        arr = pe.infer(webcam_frame)
+        if arr is not None:
+            overlay = display_left.copy()
+            draw_colored_skeleton(overlay, arr)
+            display_left = cv2.addWeighted(overlay, 0.5, display_left, 0.5, 0)
+
+        # REST 구간
+        if in_intervals(hint_idx, rest_intervals):
+            with active_session['lock']:
+                ok_ref, ref_frame, active_session['ref_frame_cur'] = read_frame_at(
+                    ref_cap, hint_idx * ref_stride, active_session['ref_frame_cur']
+                )
+            display_right = ref_frame if ok_ref else None
+            combined = _combine(display_left, display_right)
+            cv2.putText(combined, 'REST', (20, 40), font, 1.2, (200, 200, 255), 3, cv2.LINE_AA)
         else:
-            # 실시간 live_play 별도 프로세스 실행 (기본값 유지)
-            cmd = [
-                sys.executable,
-                str(demo_dir / "run_live.py"),
-                "--ref", str(ref_path),
-                "--ref-lm", str(ref_lm_path),
-                "--ref-video", str(ref_video_path),
-            ]
-            try:
-                subprocess.Popen(cmd)
-            except Exception as exc:
-                print(f"[live_play subprocess error] {exc}")
-                flash("실시간 비교 시작에 실패했습니다.", "error")
-                return redirect(url_for("index"))
+            # 포즈 분석 (스켈레톤은 이미 그려짐)
+            if arr is not None:
 
-            flash("실시간 웹캠 비교가 별도 창에서 시작되었습니다. 종료: ESC/q", "success")
-            return redirect(url_for("index"))
+                lm = normalize_landmarks(arr.copy())
+                emb = pose_embedding(lm)
+                _, ref_idx = matcher.step_with_hint(emb, hint_idx=hint_idx, search_radius=CONFIG['SEARCH_RADIUS'])
 
-    return render_template("index.html")
+                # 가중치
+                try:
+                    if ref_lm is not None and ref_idx < len(ref_lm):
+                        w_feat, _, _ = build_static_feature_weights(
+                            BONES, ANGLE_TRIPLES, lm_for_vis=ref_lm[ref_idx],
+                            region_w=region_w, angle_w=angle_w
+                        )
+                    else:
+                        w_feat = build_static_feature_weights(BONES, ANGLE_TRIPLES, lm_for_vis=None)[0]
+                except Exception:
+                    w_feat = build_static_feature_weights(BONES, ANGLE_TRIPLES, lm_for_vis=None)[0]
+
+                # 점수 계산
+                static_sim = weighted_cosine(matcher.ref[ref_idx], emb, w_feat)
+                ref_emb = matcher.ref[ref_idx]
+
+                with active_session['lock']:
+                    if active_session['prev_live_emb'] is not None and active_session['prev_ref_emb'] is not None:
+                        d_live = emb - active_session['prev_live_emb']
+                        d_ref = ref_emb - active_session['prev_ref_emb']
+                        motion_sim = weighted_cosine(d_live, d_ref, w_feat)
+                    else:
+                        motion_sim = 0.0
+
+                    blended = static_sim
+                    score = ((blended + 1.0) * 0.5)
+                    active_session['score_ema'] = exp_moving_avg(
+                        active_session['score_ema'],
+                        score,
+                        alpha=CONFIG['SCORE_EMA_ALPHA']
+                    )
+                    active_session['prev_live_emb'] = emb
+                    active_session['prev_ref_emb'] = ref_emb
+
+                    # 피드백
+                    try:
+                        if ref_lm is not None and ref_idx < len(ref_lm):
+                            msgs = angle_feedback(
+                                lm,
+                                ref_lm[ref_idx],
+                                angle_tol_deg=CONFIG['ANGLE_TOLERANCE_DEG']
+                            )
+                            active_session['feedback'] = msgs if msgs else ['Good!']
+                    except Exception:
+                        pass
+
+            # 레퍼런스 프레임
+            with active_session['lock']:
+                ok_ref, ref_frame, active_session['ref_frame_cur'] = read_frame_at(
+                    ref_cap, hint_idx * ref_stride, active_session['ref_frame_cur']
+                )
+            display_right = ref_frame if ok_ref else None
+            combined = _combine(display_left, display_right)
+
+            # 점수/등급 계산 (live_play와 동일한 정규화)
+            with active_session['lock']:
+                # 롤링 평균(3초) 계산
+                active_session['score_window'].append(active_session['score_ema'])
+                # ref_fps 기준 3초 윈도우
+                if len(active_session['score_window']) > int(ref_fps * 3):
+                    active_session['score_window'].pop(0)
+
+                avg_score = float(np.nan_to_num(
+                    np.mean(active_session['score_window']) if len(active_session['score_window']) > 0 else active_session['score_ema'],
+                    nan=0.0, posinf=1.0, neginf=0.0
+                ))
+
+                # 50~95 -> 0~100 정규화
+                avg_50_95 = avg_score * 100.0
+                avg_pct = ((avg_50_95 - 50.0) / 45.0) * 100.0
+                # 0~100로 클립
+                avg_pct = float(np.clip(avg_pct, 0.0, 100.0))
+
+                # 등급 판정 (정규화된 점수 기준)
+                grade = 'PERFECT' if avg_pct >= 65 else (
+                    'GOOD' if avg_pct >= 60 else 'BAD'
+                )
+
+                current_time = time.time()
+
+                # 매 프레임마다 등급을 히스토리에 추가
+                active_session['grade_history'].append((current_time, grade))
+
+                # 3초보다 오래된 히스토리 제거
+                grade_interval = 3.0
+                cutoff_time = current_time - grade_interval
+                active_session['grade_history'] = [
+                    (t, g) for t, g in active_session['grade_history'] if t > cutoff_time
+                ]
+
+                # 3초마다 한 번씩만 등급 평가
+                if elapsed - active_session['last_grade_time'] >= grade_interval:
+                    # 3초 동안의 히스토리에서 가장 많이 나온 등급 계산
+                    if active_session['grade_history']:
+                        from collections import Counter
+                        grade_counts_in_window = Counter(g for t, g in active_session['grade_history'])
+                        # 가장 많이 나온 등급 선택 (동점이면 PERFECT > GOOD > BAD 우선순위)
+                        most_common_grade = None
+                        max_count = 0
+                        for g in ['PERFECT', 'GOOD', 'BAD']:
+                            if grade_counts_in_window[g] > max_count:
+                                max_count = grade_counts_in_window[g]
+                                most_common_grade = g
+
+                        if most_common_grade:
+                            active_session['grade_counts'][most_common_grade] += 1
+                            active_session['graded_total'] += 1
+                            active_session['last_grade_time'] = elapsed
+                            active_session['current_grade'] = most_common_grade
+                            active_session['grade_timestamp'] = current_time
+                            # 히스토리 클리어 (새로운 3초 시작)
+                            active_session['grade_history'] = []
 
 
-@app.route("/outputs/<path:filename>")
-def serve_output(filename: str):
-    """결과 동영상 파일 제공"""
-    return send_from_directory(OUTPUT_DIR, filename, as_attachment=False)
+        # JPEG 인코딩 (CONFIG 품질 사용)
+        ret, buffer = cv2.imencode('.jpg', combined, [int(cv2.IMWRITE_JPEG_QUALITY), CONFIG['JPEG_QUALITY']])
+        if not ret:
+            continue
 
+        with active_session['lock']:
+            active_session['frame_buffer'] = combined
 
-@app.route("/outputs/<path:filename>/download")
-def download_output(filename: str):
-    """결과 동영상 파일 다운로드"""
-    return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
+        # 프레임 레이트 제어 (CONFIG에서 웹캠 FPS 사용)
+        time.sleep(1 / CONFIG['WEBCAM_FPS'])
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5001)), debug=True)
+@app.route('/')
+def index():
+    return render_template('web_live_index.html')
+
+@app.route('/api/start', methods=['POST'])
+def start_session():
+    """웹캠 세션 시작"""
+    data = request.get_json()
+
+    # 파일 업로드는 별도 엔드포인트에서 처리했다고 가정
+    ref_path = data.get('ref_path')
+    ref_lm_path = data.get('ref_lm_path')
+    ref_video_path = data.get('ref_video_path')
+
+    if not all([ref_path, ref_lm_path, ref_video_path]):
+        return jsonify({'success': False, 'message': '필수 파일 경로가 누락되었습니다.'}), 400
+
+    try:
+        init_session(ref_path, ref_lm_path, ref_video_path)
+        return jsonify({'success': True, 'message': '웹캠 세션이 시작되었습니다.'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'세션 시작 실패: {e}'}), 500
+
+@app.route('/api/upload', methods=['POST'])
+def upload_files():
+    """파일 업로드 (레퍼런스 파일만)"""
+    ref_emb = request.files.get('ref_embedding')
+    ref_lm = request.files.get('ref_landmarks')
+    ref_vid = request.files.get('ref_video')
+
+    if not all([ref_emb, ref_lm, ref_vid]):
+        return jsonify({'success': False, 'message': '필수 파일이 누락되었습니다.'}), 400
+
+    if not _ext_ok(ref_emb.filename, 'npy') or not _ext_ok(ref_lm.filename, 'npy'):
+        return jsonify({'success': False, 'message': '.npy 파일만 가능합니다.'}), 400
+
+    if not _ext_ok(ref_vid.filename, 'video'):
+        return jsonify({'success': False, 'message': '레퍼런스 영상 형식이 잘못되었습니다.'}), 400
+
+    sess_id = uuid.uuid4().hex
+    sess_dir = UPLOAD_DIR / sess_id
+    sess_dir.mkdir(parents=True, exist_ok=True)
+
+    ref_path = _save(ref_emb, sess_dir)
+    ref_lm_path = _save(ref_lm, sess_dir)
+    ref_video_path = _save(ref_vid, sess_dir)
+
+    return jsonify({
+        'success': True,
+        'ref_path': str(ref_path),
+        'ref_lm_path': str(ref_lm_path),
+        'ref_video_path': str(ref_video_path),
+    })
+
+@app.route('/api/stop', methods=['POST'])
+def stop_session():
+    """세션 중지"""
+    with active_session['lock']:
+        active_session['is_running'] = False
+        if active_session['ref_cap']:
+            active_session['ref_cap'].release()
+        if active_session['webcam_cap']:
+            active_session['webcam_cap'].release()
+        active_session['ref_cap'] = None
+        active_session['webcam_cap'] = None
+    return jsonify({'success': True, 'message': '세션이 중지되었습니다.'})
+
+@app.route('/api/status')
+def get_status():
+    """상태 조회"""
+    with active_session['lock']:
+        # Warmup 관련 정보
+        warmup_elapsed = 0.0
+        warmup_remaining = 0.0
+        is_warmup = False
+        beep_signal = None
+
+        if active_session['is_running'] and not active_session['warmup_done']:
+            warmup_elapsed = time.perf_counter() - active_session['warmup_start_t']
+            is_warmup = warmup_elapsed < CONFIG['WARMUP_SEC']
+            warmup_remaining = max(0, CONFIG['WARMUP_SEC'] - warmup_elapsed)
+
+            # 비프음 신호 (카운트다운 3, 2, 1, 0)
+            if CONFIG['COUNTDOWN_BEEP'] and is_warmup:
+                current_sec = int(warmup_remaining) + 1
+                if current_sec <= 3 and current_sec != active_session.get('last_beep_sec'):
+                    active_session['last_beep_sec'] = current_sec
+                    # 주파수: 3초=800Hz, 2초=900Hz, 1초=1000Hz
+                    beep_signal = {
+                        'frequency': 700 + current_sec * 100,
+                        'duration': 150
+                    }
+            elif not is_warmup and active_session.get('last_beep_sec') != 0:
+                # 시작 비프 (0초)
+                active_session['last_beep_sec'] = 0
+                beep_signal = {
+                    'frequency': 1400,
+                    'duration': 250
+                }
+
+        response = {
+            'is_running': active_session['is_running'],
+            'score': active_session['score_ema'] * 100.0 if active_session['score_ema'] else 0.0,
+            'is_warmup': is_warmup,
+            'warmup_remaining': warmup_remaining,
+            'grade_counts': active_session['grade_counts'],
+            'graded_total': active_session['graded_total'],
+            'current_grade': active_session['current_grade'],
+            'grade_timestamp': active_session['grade_timestamp'],
+            'final_rank': active_session['final_rank'],
+            'session_ended': active_session['session_ended'],
+        }
+
+        if beep_signal:
+            response['beep'] = beep_signal
+
+        return jsonify(response)
+
+@app.route('/video_feed')
+def video_feed():
+    """비디오 스트리밍"""
+    return Response(
+        generate_frames(),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5001)), debug=True, threaded=True, use_reloader=False)
+

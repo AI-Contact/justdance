@@ -140,6 +140,9 @@ def live_play(ref_path, ref_lm_path, camera=0, search_radius=0, ema_alpha=0.9, s
     ref_frame_cur = 0
     grade_counts = {"PERFECT": 0, "GOOD": 0, "BAD": 0}
     graded_total = 0
+    last_grade_time = 0.0  # 마지막으로 등급을 매긴 시간
+    grade_interval = 3.0   # 등급 매기는 간격 (초)
+    grade_history = []     # 3초간 등급 히스토리 [(timestamp, grade), ...]
     window_name = "Fitness Dance - Live (left: YOU, right: REFERENCE)"
 
     while True:
@@ -345,11 +348,37 @@ def live_play(ref_path, ref_lm_path, camera=0, search_radius=0, ema_alpha=0.9, s
         else:
             grade_text, grade_color = "BAD", (255,0,0)
 
-        if grade_text:
-            key = grade_text
-            if key in grade_counts:
-                grade_counts[key] += 1
-                graded_total += 1
+        # 매 프레임마다 등급을 히스토리에 추가
+        current_time = time.perf_counter()
+        if grade_text and sync_start_t is not None:
+            grade_history.append((current_time, grade_text))
+
+            # 3초보다 오래된 히스토리 제거
+            cutoff_time = current_time - grade_interval
+            grade_history[:] = [(t, g) for t, g in grade_history if t > cutoff_time]
+
+            # 3초마다 한 번씩만 등급 평가 (warmup 완료 후 경과 시간 기준)
+            elapsed_since_start = current_time - sync_start_t
+            if elapsed_since_start - last_grade_time >= grade_interval:
+                # 3초 동안의 히스토리에서 가장 많이 나온 등급 계산
+                if grade_history:
+                    from collections import Counter
+                    grade_counts_in_window = Counter(g for t, g in grade_history)
+                    # 가장 많이 나온 등급 선택 (동점이면 PERFECT > GOOD > BAD 우선순위)
+                    most_common_grade = None
+                    max_count = 0
+                    for g in ['PERFECT', 'GOOD', 'BAD']:
+                        if grade_counts_in_window[g] > max_count:
+                            max_count = grade_counts_in_window[g]
+                            most_common_grade = g
+
+                    if most_common_grade and most_common_grade in grade_counts:
+                        grade_counts[most_common_grade] += 1
+                        graded_total += 1
+                        last_grade_time = elapsed_since_start
+                        # 히스토리 클리어 (새로운 3초 시작)
+                        grade_history.clear()
+
 
         cv2.putText(combined, f"Similarity(avg): {avg_pct:.1f}%  {avg_score*100:.1f}%", (20, 40), font, 1.0, (0,255,0), 2, cv2.LINE_AA)
         cv2.putText(combined, grade_text, (20, 90), font, 1.4, grade_color, 3, cv2.LINE_AA)

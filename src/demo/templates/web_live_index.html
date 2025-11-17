@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>웹 실시간 포즈 비교</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+            font-size: 2.5rem;
+        }
+        .upload-section {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 5px;
+            color: #555;
+        }
+        input[type="file"] {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            background: white;
+        }
+        .btn {
+            padding: 12px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin: 5px;
+        }
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+        .btn-primary:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        .btn-danger {
+            background: #f56565;
+            color: white;
+        }
+        .btn-danger:hover {
+            background: #e53e3e;
+        }
+        .video-container {
+            background: #000;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-top: 20px;
+            display: none;
+        }
+        .video-container.active {
+            display: block;
+        }
+        #videoFeed {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+        .status-bar {
+            background: #e6f2ff;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+            display: none;
+        }
+        .status-bar.active {
+            display: block;
+        }
+        .status-item {
+            display: inline-block;
+            margin-right: 20px;
+            font-weight: 600;
+        }
+        .alert {
+            padding: 12px 20px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            display: none;
+        }
+        .alert.show {
+            display: block;
+        }
+        .alert-success {
+            background: #c6f6d5;
+            color: #22543d;
+            border-left: 4px solid #38a169;
+        }
+        .alert-error {
+            background: #fed7d7;
+            color: #742a2a;
+            border-left: 4px solid #e53e3e;
+        }
+        .help-text {
+            font-size: 0.875rem;
+            color: #718096;
+            margin-top: 5px;
+        }
+        .controls {
+            text-align: center;
+            margin-top: 20px;
+        }
+        /* 대형 등급 표시 */
+        .grade-display-big {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 999;
+            animation: gradePopIn 0.3s ease-out;
+        }
+        .grade-badge {
+            font-size: 8rem;
+            font-weight: bold;
+            padding: 40px 80px;
+            border-radius: 30px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+            text-shadow: 0 0 30px currentColor;
+            animation: gradePulse 0.5s ease-in-out;
+        }
+        .grade-badge.PERFECT {
+            background: linear-gradient(135deg, #FFD700, #FFA500);
+            color: white;
+        }
+        .grade-badge.GOOD {
+            background: linear-gradient(135deg, #00FF00, #00CC00);
+            color: white;
+        }
+        .grade-badge.BAD {
+            background: linear-gradient(135deg, #FF0000, #CC0000);
+            color: white;
+        }
+        @keyframes gradePopIn {
+            from {
+                transform: translate(-50%, -50%) scale(0);
+                opacity: 0;
+            }
+            to {
+                transform: translate(-50%, -50%) scale(1);
+                opacity: 1;
+            }
+        }
+        @keyframes gradePulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+        }
+        /* 최종 결과 모달 */
+        .result-modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.8);
+            animation: fadeIn 0.3s;
+        }
+        .result-modal.show {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .result-content {
+            background: white;
+            padding: 40px;
+            border-radius: 15px;
+            text-align: center;
+            max-width: 500px;
+            animation: slideUp 0.5s;
+        }
+        .rank-display {
+            font-size: 5rem;
+            font-weight: bold;
+            margin: 20px 0;
+        }
+        .rank-S { color: #FFD700; text-shadow: 0 0 20px #FFD700; }
+        .rank-A { color: #00FF00; text-shadow: 0 0 20px #00FF00; }
+        .rank-B { color: #00BFFF; text-shadow: 0 0 20px #00BFFF; }
+        .rank-C { color: #FFA500; text-shadow: 0 0 20px #FFA500; }
+        .rank-F { color: #FF0000; text-shadow: 0 0 20px #FF0000; }
+        .grade-breakdown {
+            margin: 20px 0;
+            text-align: left;
+        }
+        .grade-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px;
+            border-bottom: 1px solid #eee;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        @keyframes slideUp {
+            from { transform: translateY(50px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎯 웹캠 실시간 포즈 비교</h1>
+
+        <div id="alertBox" class="alert"></div>
+
+        <div class="upload-section">
+            <h2 style="margin-bottom: 15px;">파일 업로드</h2>
+            <div class="form-group">
+                <label>레퍼런스 임베딩 (.npy) *</label>
+                <input type="file" id="refEmbedding" accept=".npy" required>
+                <p class="help-text">extract.py로 생성한 레퍼런스 임베딩 파일</p>
+            </div>
+
+            <div class="form-group">
+                <label>레퍼런스 랜드마크 (.npy) *</label>
+                <input type="file" id="refLandmarks" accept=".npy" required>
+                <p class="help-text">레퍼런스 랜드마크 배열 파일</p>
+            </div>
+
+            <div class="form-group">
+                <label>레퍼런스 영상 (video) *</label>
+                <input type="file" id="refVideo" accept="video/*" required>
+                <p class="help-text">가이드 영상 파일 (우측에 표시됨)</p>
+            </div>
+
+            <div class="controls">
+                <button class="btn btn-primary" id="startBtn">▶ 웹캠 비교 시작</button>
+                <button class="btn btn-danger" id="stopBtn" style="display: none;">⏹ 중지</button>
+            </div>
+        </div>
+
+        <div class="status-bar" id="statusBar">
+            <span class="status-item">점수: <span id="statusScore">-</span>%</span>
+            <span class="status-item">상태: <span id="statusRunning">대기 중</span></span>
+        </div>
+
+        <!-- 현재 등급 대형 표시 (일시적) -->
+        <div class="grade-display-big" id="gradeDisplayBig" style="display: none;">
+            <div class="grade-badge" id="gradeBadge">-</div>
+        </div>
+
+        <div class="status-bar" id="gradeStatsBar" style="display: none; margin-top: 10px; background: #fff3cd;">
+            <span class="status-item">🏆 PERFECT: <span id="perfectCount">0</span></span>
+            <span class="status-item">✅ GOOD: <span id="goodCount">0</span></span>
+            <span class="status-item">❌ BAD: <span id="badCount">0</span></span>
+            <span class="status-item">총 평가: <span id="totalGraded">0</span>회</span>
+        </div>
+
+        <div class="video-container" id="videoContainer">
+            <img id="videoFeed" src="" alt="비교 영상">
+        </div>
+    </div>
+
+    <!-- 최종 결과 모달 -->
+    <div class="result-modal" id="resultModal">
+        <div class="result-content">
+            <h2>🎉 운동 완료!</h2>
+            <div class="rank-display" id="finalRank">-</div>
+            <h3>성적표</h3>
+            <div class="grade-breakdown">
+                <div class="grade-item">
+                    <span>🏆 PERFECT</span>
+                    <span id="finalPerfect">0 (0%)</span>
+                </div>
+                <div class="grade-item">
+                    <span>✅ GOOD</span>
+                    <span id="finalGood">0 (0%)</span>
+                </div>
+                <div class="grade-item">
+                    <span>❌ BAD</span>
+                    <span id="finalBad">0 (0%)</span>
+                </div>
+                <div class="grade-item" style="border-bottom: none; font-weight: bold;">
+                    <span>총 평가</span>
+                    <span id="finalTotal">0회</span>
+                </div>
+            </div>
+            <button class="btn btn-primary" onclick="closeResultModal()" style="margin-top: 20px;">확인</button>
+        </div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+    <script>
+        let isRunning = false;
+        let statusInterval = null;
+        let uploadedPaths = null;
+        let lastGradeTimestamp = 0;
+        let gradeHideTimer = null;
+
+        // Web Audio API 초기화 (비프음용)
+        let audioContext = null;
+        function initAudio() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+        }
+
+        // 비프음 재생
+        function playBeep(frequency, duration) {
+            if (!audioContext) return;
+
+            const oscillator = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
+
+            oscillator.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+
+            oscillator.frequency.value = frequency;
+            oscillator.type = 'square';  // 'sine' → 'square' (더 선명하고 강한 소리)
+            // 다른 옵션: 'triangle', 'sawtooth'
+
+            // 볼륨 증가 (0.3 → 0.6) 및 빠른 페이드아웃
+            gainNode.gain.setValueAtTime(0.6, audioContext.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + duration / 1000);
+
+            oscillator.start(audioContext.currentTime);
+            oscillator.stop(audioContext.currentTime + duration / 1000);
+        }
+
+
+        // 알림 표시
+        function showAlert(message, type = 'success') {
+            const alertBox = document.getElementById('alertBox');
+            alertBox.textContent = message;
+            alertBox.className = `alert alert-${type} show`;
+            setTimeout(() => {
+                alertBox.classList.remove('show');
+            }, 5000);
+        }
+
+        // 파일 업로드
+        async function uploadFiles() {
+            const refEmb = document.getElementById('refEmbedding').files[0];
+            const refLm = document.getElementById('refLandmarks').files[0];
+            const refVid = document.getElementById('refVideo').files[0];
+
+            if (!refEmb || !refLm || !refVid) {
+                showAlert('필수 파일을 모두 선택해주세요.', 'error');
+                return null;
+            }
+
+            const formData = new FormData();
+            formData.append('ref_embedding', refEmb);
+            formData.append('ref_landmarks', refLm);
+            formData.append('ref_video', refVid);
+
+            try {
+                const response = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                if (data.success) {
+                    return data;
+                } else {
+                    showAlert(data.message || '업로드 실패', 'error');
+                    return null;
+                }
+            } catch (error) {
+                showAlert('업로드 중 오류: ' + error.message, 'error');
+                return null;
+            }
+        }
+
+        // 세션 시작
+        async function startSession() {
+            if (!uploadedPaths) {
+                uploadedPaths = await uploadFiles();
+                if (!uploadedPaths) return;
+            }
+
+            // 오디오 컨텍스트 초기화 (사용자 제스처 필요)
+            initAudio();
+
+            const payload = {
+                ref_path: uploadedPaths.ref_path,
+                ref_lm_path: uploadedPaths.ref_lm_path,
+                ref_video_path: uploadedPaths.ref_video_path,
+            };
+
+            try {
+                const response = await fetch('/api/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await response.json();
+                if (data.success) {
+                    isRunning = true;
+                    document.getElementById('startBtn').style.display = 'none';
+                    document.getElementById('stopBtn').style.display = 'inline-block';
+                    document.getElementById('videoContainer').classList.add('active');
+                    document.getElementById('statusBar').classList.add('active');
+                    // 등급 통계바는 최종 결과에서만 표시
+                    document.getElementById('gradeStatsBar').style.display = 'none';
+
+                    // 비디오 피드 URL 설정
+                    const videoFeed = document.getElementById('videoFeed');
+                    videoFeed.src = '/video_feed?' + new Date().getTime();
+                    videoFeed.onerror = function() {
+                        console.error('비디오 피드 로딩 실패');
+                        showAlert('비디오 스트림을 로드할 수 없습니다.', 'error');
+                    };
+                    videoFeed.onload = function() {
+                        console.log('비디오 피드 로딩 성공');
+                    };
+
+                    // 상태 폴링 시작
+                    statusInterval = setInterval(updateStatus, 1000);
+
+                    showAlert(data.message, 'success');
+                } else {
+                    showAlert(data.message || '시작 실패', 'error');
+                }
+            } catch (error) {
+                showAlert('세션 시작 오류: ' + error.message, 'error');
+            }
+        }
+
+        // 세션 중지
+        async function stopSession() {
+            try {
+                const response = await fetch('/api/stop', { method: 'POST' });
+                const data = await response.json();
+
+                isRunning = false;
+                document.getElementById('startBtn').style.display = 'inline-block';
+                document.getElementById('stopBtn').style.display = 'none';
+                document.getElementById('videoContainer').classList.remove('active');
+                document.getElementById('statusBar').classList.remove('active');
+                document.getElementById('gradeStatsBar').style.display = 'none';
+                document.getElementById('gradeDisplayBig').style.display = 'none';
+
+                if (statusInterval) {
+                    clearInterval(statusInterval);
+                    statusInterval = null;
+                }
+
+                if (gradeHideTimer) {
+                    clearTimeout(gradeHideTimer);
+                    gradeHideTimer = null;
+                }
+
+                lastGradeTimestamp = 0;
+
+                showAlert(data.message || '중지되었습니다.', 'success');
+                uploadedPaths = null;  // 다음 시작 시 재업로드
+            } catch (error) {
+                showAlert('중지 오류: ' + error.message, 'error');
+            }
+        }
+
+        // 상태 업데이트
+        async function updateStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+
+                console.log('Status update:', data); // 디버깅 로그
+
+                document.getElementById('statusScore').textContent = data.score ? data.score.toFixed(1) : '-';
+                document.getElementById('statusRunning').textContent = data.is_running ? '실행 중' : '중지됨';
+
+                // 등급 통계 업데이트 (누적 카운트는 숨김 - 최종 결과에서만 표시)
+                if (data.graded_total > 0) {
+                    document.getElementById('perfectCount').textContent = data.grade_counts.PERFECT || 0;
+                    document.getElementById('goodCount').textContent = data.grade_counts.GOOD || 0;
+                    document.getElementById('badCount').textContent = data.grade_counts.BAD || 0;
+                    document.getElementById('totalGraded').textContent = data.graded_total;
+                }
+
+                // 새로운 등급이 매겨졌을 때만 일시적으로 표시 (2초)
+                if (data.current_grade && data.grade_timestamp > lastGradeTimestamp) {
+                    lastGradeTimestamp = data.grade_timestamp;
+                    showGradeBig(data.current_grade);
+                }
+
+                // 세션 종료 시 최종 결과 모달 표시
+                if (data.session_ended && data.final_rank) {
+                    console.log('Session ended, showing final result:', data.final_rank);
+                    showFinalResult(data);
+                }
+
+                // 비프음 재생
+                if (data.beep && audioContext) {
+                    playBeep(data.beep.frequency, data.beep.duration);
+                }
+
+                if (!data.is_running && isRunning) {
+                    // 자동 종료됨
+                    console.log('Session stopped automatically');
+                    stopSession();
+                }
+            } catch (error) {
+                console.error('상태 업데이트 오류:', error);
+            }
+        }
+
+        // 대형 등급 표시 (2초간)
+        function showGradeBig(grade) {
+            const displayBig = document.getElementById('gradeDisplayBig');
+            const badge = document.getElementById('gradeBadge');
+
+            // 이전 타이머 취소
+            if (gradeHideTimer) {
+                clearTimeout(gradeHideTimer);
+            }
+
+            // 등급 설정
+            badge.textContent = grade;
+            badge.className = `grade-badge ${grade}`;
+
+            // 표시
+            displayBig.style.display = 'block';
+
+            // 2초 후 자동 숨김
+            gradeHideTimer = setTimeout(() => {
+                displayBig.style.display = 'none';
+            }, 2000);
+        }
+
+        // 최종 결과 모달 표시
+        function showFinalResult(data) {
+            console.log('showFinalResult called with:', data);
+
+            const modal = document.getElementById('resultModal');
+            const rankDisplay = document.getElementById('finalRank');
+
+            if (!modal || !rankDisplay) {
+                console.error('Modal elements not found!');
+                return;
+            }
+
+            // 랭크에 따라 색상 적용
+            rankDisplay.textContent = data.final_rank;
+            rankDisplay.className = `rank-display rank-${data.final_rank}`;
+
+            // 통계 표시
+            const total = data.graded_total || 1; // 0으로 나누기 방지
+            const pCnt = data.grade_counts.PERFECT || 0;
+            const gCnt = data.grade_counts.GOOD || 0;
+            const bCnt = data.grade_counts.BAD || 0;
+
+            document.getElementById('finalPerfect').textContent = `${pCnt} (${(pCnt/total*100).toFixed(1)}%)`;
+            document.getElementById('finalGood').textContent = `${gCnt} (${(gCnt/total*100).toFixed(1)}%)`;
+            document.getElementById('finalBad').textContent = `${bCnt} (${(bCnt/total*100).toFixed(1)}%)`;
+            document.getElementById('finalTotal').textContent = `${total}회`;
+
+            // 등급 통계바도 표시
+            document.getElementById('gradeStatsBar').style.display = 'block';
+
+            modal.classList.add('show');
+            console.log('Modal displayed');
+        }
+
+        // 최종 결과 모달 닫기
+        function closeResultModal() {
+            document.getElementById('resultModal').classList.remove('show');
+        }
+
+        // 이벤트 리스너
+        document.getElementById('startBtn').addEventListener('click', startSession);
+        document.getElementById('stopBtn').addEventListener('click', stopSession);
+    </script>
+</body>
+</html>
+
