@@ -180,6 +180,25 @@
             0%, 100% { transform: scale(1); }
             50% { transform: scale(1.1); }
         }
+        /* REST 상태 표시 */
+        .rest-display {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 998;
+            animation: fadeIn 0.3s ease-out;
+        }
+        .rest-badge {
+            font-size: 6rem;
+            font-weight: bold;
+            padding: 40px 80px;
+            border-radius: 30px;
+            background: linear-gradient(135deg, #87CEEB, #4682B4);
+            color: white;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+            text-shadow: 0 0 30px rgba(255, 255, 255, 0.5);
+        }
         /* 최종 결과 모달 */
         .result-modal {
             display: none;
@@ -222,8 +241,17 @@
         .grade-item {
             display: flex;
             justify-content: space-between;
-            padding: 10px;
+            padding: 15px 20px;
             border-bottom: 1px solid #eee;
+            font-size: 1.1rem;
+        }
+        .grade-item span:first-child {
+            flex: 0 0 auto;
+        }
+        .grade-item span:last-child {
+            flex: 0 0 auto;
+            font-weight: bold;
+            margin-left: 40px;
         }
         @keyframes fadeIn {
             from { opacity: 0; }
@@ -272,10 +300,18 @@
             <span class="status-item">상태: <span id="statusRunning">대기 중</span></span>
         </div>
 
-        <!-- 현재 등급 대형 표시 (일시적) -->
+        <!-- 대형 등급 표시 (일시적) -->
         <div class="grade-display-big" id="gradeDisplayBig" style="display: none;">
             <div class="grade-badge" id="gradeBadge">-</div>
         </div>
+
+        <!-- REST 상태 표시 -->
+        <div class="rest-display" id="restDisplay" style="display: none;">
+            <div class="rest-badge">쉬는 시간</div>
+        </div>
+
+        <!-- 레퍼런스 비디오 오디오 재생용 (숨김) -->
+        <video id="refAudio" style="display: none;" preload="auto"></video>
 
         <div class="status-bar" id="gradeStatsBar" style="display: none; margin-top: 10px; background: #fff3cd;">
             <span class="status-item">🏆 PERFECT: <span id="perfectCount">0</span></span>
@@ -324,6 +360,9 @@
         let uploadedPaths = null;
         let lastGradeTimestamp = 0;
         let gradeHideTimer = null;
+        let finalResultShown = false; // 최종 결과 모달 표시 여부 플래그
+        let refAudioElement = null; // 레퍼런스 오디오 엘리먼트
+        let wasInWarmup = false; // 이전 warmup 상태
 
         // Web Audio API 초기화 (비프음용)
         let audioContext = null;
@@ -425,6 +464,7 @@
                 const data = await response.json();
                 if (data.success) {
                     isRunning = true;
+                    finalResultShown = false; // 새 세션 시작 시 플래그 초기화
                     document.getElementById('startBtn').style.display = 'none';
                     document.getElementById('stopBtn').style.display = 'inline-block';
                     document.getElementById('videoContainer').classList.add('active');
@@ -442,6 +482,34 @@
                     videoFeed.onload = function() {
                         console.log('비디오 피드 로딩 성공');
                     };
+
+                    // 레퍼런스 비디오 오디오 설정
+                    refAudioElement = document.getElementById('refAudio');
+                    refAudioElement.src = '/api/ref_video?' + new Date().getTime();
+                    refAudioElement.volume = 0.7; // 볼륨 70%
+                    refAudioElement.muted = false; // 음소거 해제
+
+                    // 오디오 로드 및 준비
+                    try {
+                        await refAudioElement.load();
+                        console.log('레퍼런스 오디오 로드 완료');
+
+                        // 브라우저 자동재생 정책 우회: 짧게 재생 후 즉시 일시정지
+                        const playPromise = refAudioElement.play();
+                        if (playPromise !== undefined) {
+                            playPromise.then(() => {
+                                console.log('오디오 언락 성공');
+                                refAudioElement.pause();
+                                refAudioElement.currentTime = 0;
+                            }).catch(err => {
+                                console.warn('오디오 언락 실패:', err);
+                            });
+                        }
+                    } catch (err) {
+                        console.error('오디오 로드 실패:', err);
+                    }
+
+                    wasInWarmup = true; // warmup 시작
 
                     // 상태 폴링 시작
                     statusInterval = setInterval(updateStatus, 1000);
@@ -468,6 +536,16 @@
                 document.getElementById('statusBar').classList.remove('active');
                 document.getElementById('gradeStatsBar').style.display = 'none';
                 document.getElementById('gradeDisplayBig').style.display = 'none';
+                document.getElementById('restDisplay').style.display = 'none';
+
+                // 레퍼런스 오디오 중지
+                if (refAudioElement) {
+                    refAudioElement.pause();
+                    refAudioElement.currentTime = 0;
+                    refAudioElement = null;
+                }
+
+                wasInWarmup = false; // warmup 상태 초기화
 
                 if (statusInterval) {
                     clearInterval(statusInterval);
@@ -480,6 +558,7 @@
                 }
 
                 lastGradeTimestamp = 0;
+                finalResultShown = false; // 플래그 초기화
 
                 showAlert(data.message || '중지되었습니다.', 'success');
                 uploadedPaths = null;  // 다음 시작 시 재업로드
@@ -513,9 +592,45 @@
                     showGradeBig(data.current_grade);
                 }
 
-                // 세션 종료 시 최종 결과 모달 표시
-                if (data.session_ended && data.final_rank) {
+                // REST 상태 표시
+                const restDisplay = document.getElementById('restDisplay');
+                if (data.is_rest) {
+                    restDisplay.style.display = 'block';
+                } else {
+                    restDisplay.style.display = 'none';
+                }
+
+                // Warmup 종료 시점 감지 및 레퍼런스 오디오 재생
+                if (wasInWarmup && !data.is_warmup && refAudioElement && data.is_running) {
+                    console.log('Warmup 종료 - 오디오 재생 시작');
+                    console.log('오디오 상태:', {
+                        paused: refAudioElement.paused,
+                        currentTime: refAudioElement.currentTime,
+                        volume: refAudioElement.volume,
+                        muted: refAudioElement.muted,
+                        readyState: refAudioElement.readyState
+                    });
+
+                    refAudioElement.currentTime = 0;
+                    refAudioElement.muted = false;
+                    refAudioElement.volume = 0.7;
+
+                    const playPromise = refAudioElement.play();
+                    if (playPromise !== undefined) {
+                        playPromise.then(() => {
+                            console.log('✅ 오디오 재생 성공!');
+                        }).catch(err => {
+                            console.error('❌ 오디오 재생 실패:', err);
+                            showAlert('오디오 재생 실패: ' + err.message + '. 브라우저 설정을 확인하세요.', 'error');
+                        });
+                    }
+                }
+                wasInWarmup = data.is_warmup;
+
+                // 세션 종료 시 최종 결과 모달 표시 (한 번만)
+                if (data.session_ended && data.final_rank && !finalResultShown) {
                     console.log('Session ended, showing final result:', data.final_rank);
+                    finalResultShown = true; // 플래그 설정하여 재표시 방지
                     showFinalResult(data);
                 }
 
@@ -573,15 +688,15 @@
             rankDisplay.textContent = data.final_rank;
             rankDisplay.className = `rank-display rank-${data.final_rank}`;
 
-            // 통계 표시
+            // 통계 표시 (비율만)
             const total = data.graded_total || 1; // 0으로 나누기 방지
             const pCnt = data.grade_counts.PERFECT || 0;
             const gCnt = data.grade_counts.GOOD || 0;
             const bCnt = data.grade_counts.BAD || 0;
 
-            document.getElementById('finalPerfect').textContent = `${pCnt} (${(pCnt/total*100).toFixed(1)}%)`;
-            document.getElementById('finalGood').textContent = `${gCnt} (${(gCnt/total*100).toFixed(1)}%)`;
-            document.getElementById('finalBad').textContent = `${bCnt} (${(bCnt/total*100).toFixed(1)}%)`;
+            document.getElementById('finalPerfect').textContent = `${(pCnt/total*100).toFixed(1)}%`;
+            document.getElementById('finalGood').textContent = `${(gCnt/total*100).toFixed(1)}%`;
+            document.getElementById('finalBad').textContent = `${(bCnt/total*100).toFixed(1)}%`;
             document.getElementById('finalTotal').textContent = `${total}회`;
 
             // 등급 통계바도 표시
@@ -594,6 +709,7 @@
         // 최종 결과 모달 닫기
         function closeResultModal() {
             document.getElementById('resultModal').classList.remove('show');
+            finalResultShown = false; // 플래그 초기화 (재시작 시 다시 표시 가능하도록)
         }
 
         // 이벤트 리스너

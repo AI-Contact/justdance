@@ -147,6 +147,7 @@ active_session = {
     'final_rank': None,      # 최종 랭크 (S-F)
     'session_ended': False,  # 세션 종료 여부
     'end_time': 0.0,         # 세션 종료 시간
+    'is_rest': False,        # 현재 REST 구간 여부
     'frame_buffer': None,  # 최신 합성 프레임
     'lock': threading.Lock(),
 }
@@ -260,6 +261,7 @@ def init_session(ref_path: str, ref_lm_path: str, ref_video_path: str):
             'final_rank': None,
             'session_ended': False,
             'end_time': 0.0,
+            'is_rest': False,
             'frame_buffer': None,
         })
 
@@ -383,68 +385,12 @@ def generate_frames():
                     print(f"BAD    : {b_cnt} ({(b_cnt/graded_total)*100:.1f}%)")
                     print(f"FINAL RANK: {final_rank}")
 
-        # session_ended 후에도 5초간 결과 화면 표시
+        # session_ended 후 바로 세션 종료
         if active_session.get('session_ended', False):
-            elapsed_since_end = time.perf_counter() - active_session.get('end_time', 0)
-
-            # 5초 후 세션 종료
-            if elapsed_since_end >= 5.0:
-                with active_session['lock']:
-                    active_session['is_running'] = False
-                break
-
-            # 결과 화면 생성
-            display_left = webcam_frame.copy()
-
-            # 레퍼런스 마지막 프레임
             with active_session['lock']:
-                if ref_cap.isOpened():
-                    total_frames = int(ref_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    ref_cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 1))
-                    ok_ref, ref_frame = ref_cap.read()
-                else:
-                    ok_ref = False
+                active_session['is_running'] = False
+            break
 
-            display_right = ref_frame if ok_ref else None
-            combined = _combine(display_left, display_right)
-
-            # 최종 결과 오버레이
-            overlay = combined.copy()
-            cv2.rectangle(overlay, (0, 0), (combined.shape[1], combined.shape[0]), (0, 0, 0), -1)
-            combined = cv2.addWeighted(overlay, 0.7, combined, 0.3, 0)
-
-            y = 150
-            final_rank = active_session.get('final_rank', 'F')
-            rank_color = (0, 255, 0) if final_rank in ['S', 'A'] else ((0, 200, 255) if final_rank == 'B' else (255, 200, 0) if final_rank == 'C' else (255, 0, 0))
-
-            cv2.putText(combined, "SESSION ENDED", (combined.shape[1]//2 - 200, y), font, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
-            y += 80
-            cv2.putText(combined, f"FINAL RANK: {final_rank}", (combined.shape[1]//2 - 180, y), font, 2.0, rank_color, 4, cv2.LINE_AA)
-            y += 80
-
-            graded_total = active_session['graded_total']
-            if graded_total > 0:
-                p_cnt = active_session['grade_counts']['PERFECT']
-                g_cnt = active_session['grade_counts']['GOOD']
-                b_cnt = active_session['grade_counts']['BAD']
-
-                cv2.putText(combined, f"PERFECT: {p_cnt} ({(p_cnt/graded_total)*100:.1f}%)", (combined.shape[1]//2 - 180, y), font, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
-                y += 40
-                cv2.putText(combined, f"GOOD   : {g_cnt} ({(g_cnt/graded_total)*100:.1f}%)", (combined.shape[1]//2 - 180, y), font, 1.0, (0, 200, 255), 2, cv2.LINE_AA)
-                y += 40
-                cv2.putText(combined, f"BAD    : {b_cnt} ({(b_cnt/graded_total)*100:.1f}%)", (combined.shape[1]//2 - 180, y), font, 1.0, (255, 0, 0), 2, cv2.LINE_AA)
-
-            # JPEG 인코딩 및 전송
-            ret, buffer = cv2.imencode('.jpg', combined, [int(cv2.IMWRITE_JPEG_QUALITY), CONFIG['JPEG_QUALITY']])
-            if ret:
-                with active_session['lock']:
-                    active_session['frame_buffer'] = combined
-                frame_bytes = buffer.tobytes()
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-
-            time.sleep(1 / CONFIG['WEBCAM_FPS'])
-            continue
 
         display_left = webcam_frame.copy()
 
@@ -458,13 +404,16 @@ def generate_frames():
         # REST 구간
         if in_intervals(hint_idx, rest_intervals):
             with active_session['lock']:
+                active_session['is_rest'] = True
                 ok_ref, ref_frame, active_session['ref_frame_cur'] = read_frame_at(
                     ref_cap, hint_idx * ref_stride, active_session['ref_frame_cur']
                 )
             display_right = ref_frame if ok_ref else None
             combined = _combine(display_left, display_right)
-            cv2.putText(combined, 'REST', (20, 40), font, 1.2, (200, 200, 255), 3, cv2.LINE_AA)
+            # REST 텍스트를 CV에 표시하지 않음 (웹에서만 표시)
         else:
+            with active_session['lock']:
+                active_session['is_rest'] = False
             # 포즈 분석 (스켈레톤은 이미 그려짐)
             if arr is not None:
 
@@ -706,6 +655,7 @@ def get_status():
             'score': active_session['score_ema'] * 100.0 if active_session['score_ema'] else 0.0,
             'is_warmup': is_warmup,
             'warmup_remaining': warmup_remaining,
+            'is_rest': active_session['is_rest'],
             'grade_counts': active_session['grade_counts'],
             'graded_total': active_session['graded_total'],
             'current_grade': active_session['current_grade'],
@@ -725,6 +675,28 @@ def video_feed():
     return Response(
         generate_frames(),
         mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
+
+@app.route('/api/ref_video')
+def get_ref_video():
+    """레퍼런스 비디오 파일 제공 (오디오 재생용)"""
+    with active_session['lock']:
+        ref_video_path = active_session.get('ref_video_path')
+        if not ref_video_path or not Path(ref_video_path).exists():
+            return jsonify({'success': False, 'message': '레퍼런스 비디오가 없습니다.'}), 404
+
+    from flask import send_file
+    import mimetypes
+
+    # 파일 확장자에 따라 MIME 타입 자동 설정
+    video_path = Path(ref_video_path)
+    mime_type = mimetypes.guess_type(str(video_path))[0] or 'video/mp4'
+
+    return send_file(
+        ref_video_path,
+        mimetype=mime_type,
+        as_attachment=False,
+        conditional=True  # Range 요청 지원
     )
 
 if __name__ == '__main__':
