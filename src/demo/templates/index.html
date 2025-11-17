@@ -1,0 +1,64 @@
+{% extends "base.html" %} {% block title %}Pose Comparison Demo - 업로드{%
+endblock %} {% block content %}
+<h1>🎯 Pose Comparison Demo</h1>
+<p class="subtitle">
+  사용자 동영상과 레퍼런스 포즈를 비교하여 유사도를 분석합니다
+</p>
+
+<form method="POST" enctype="multipart/form-data">
+  <div class="form-group">
+    <label for="ref_embedding">레퍼런스 임베딩 파일 (.npy) *</label>
+    <input
+      type="file"
+      id="ref_embedding"
+      name="ref_embedding"
+      accept=".npy"
+      required
+    />
+    <p class="help-text">
+      extract.py로 생성한 레퍼런스 임베딩 파일을 업로드하세요
+    </p>
+  </div>
+
+  <div class="form-group">
+    <label for="ref_landmarks">레퍼런스 랜드마크 파일 (.npy) *</label>
+    <input
+      type="file"
+      id="ref_landmarks"
+      name="ref_landmarks"
+      accept=".npy"
+      required
+    />
+    <p class="help-text">레퍼런스의 랜드마크 배열(.npy)을 업로드하세요</p>
+  </div>
+
+  <div class="form-group">
+    <label for="ref_video">레퍼런스 영상 파일 (.mp4 등) *</label>
+    <input type="file" id="ref_video" name="ref_video" accept="video/*" required />
+    <p class="help-text">레퍼런스 가이드 영상 파일 (비교 화면에 표시됨)</p>
+  </div>
+
+  <div class="form-group">
+    <label for="user_video">사용자 동영상 파일 (선택)</label>
+    <input
+      type="file"
+      id="user_video"
+      name="user_video"
+      accept="video/*"
+    />
+    <p class="help-text">
+      비교할 사용자 동영상 파일을 업로드하지 않으면 실시간 웹캠 비교로 전환됩니다
+    </p>
+  </div>
+
+  <div class="form-group">
+    <label for="rest_json">REST 구간 JSON 파일 (선택)</label>
+    <input type="file" id="rest_json" name="rest_json" accept=".json" />
+    <p class="help-text">쉬는 구간 정보가 담긴 JSON 파일</p>
+  </div>
+
+  <div style="margin-top: 40px; text-align: center">
+    <button type="submit" class="btn">비교 시작 🚀</button>
+  </div>
+</form>
+{% endblock %}

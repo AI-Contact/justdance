@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% block title %}Pose Stream Demo{% endblock %}
+{% block content %}
+<h1>🌐 Pose Stream Demo</h1>
+<p class="subtitle">브라우저 웹캠 / 사용자 영상 / 로컬 live_play 를 최소 인자 정책으로 실행하는 데모</p>
+
+<section class="card">
+  <h2>1. 업로드 비교 (compare_videos)</h2>
+  <form method="POST" action="{{ url_for('start_upload_compare') }}" enctype="multipart/form-data">
+    <div class="form-group">
+      <label>레퍼런스 임베딩 (.npy)*</label>
+      <input type="file" name="ref_embedding" accept=".npy" required />
+    </div>
+    <div class="form-group">
+      <label>레퍼런스 랜드마크 (.npy)*</label>
+      <input type="file" name="ref_landmarks" accept=".npy" required />
+    </div>
+    <div class="form-group">
+      <label>레퍼런스 영상 (video)*</label>
+      <input type="file" name="ref_video" accept="video/*" required />
+    </div>
+    <div class="form-group">
+      <label>사용자 영상 (video)*</label>
+      <input type="file" name="user_video" accept="video/*" required />
+    </div>
+    <button type="submit" class="btn">비교 시작</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>2. 실시간 로컬 웹캠 (live_play subprocess)</h2>
+  <form method="POST" action="{{ url_for('start_local_live') }}" enctype="multipart/form-data">
+    <div class="form-group">
+      <label>레퍼런스 임베딩 (.npy)*</label>
+      <input type="file" name="ref_embedding" accept=".npy" required />
+    </div>
+    <div class="form-group">
+      <label>레퍼런스 랜드마크 (.npy)*</label>
+      <input type="file" name="ref_landmarks" accept=".npy" required />
+    </div>
+    <div class="form-group">
+      <label>레퍼런스 영상 (video)*</label>
+      <input type="file" name="ref_video" accept="video/*" required />
+    </div>
+    <button type="submit" class="btn">실시간 시작</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>3. 브라우저 실시간 스트리밍 (Socket.IO)</h2>
+  <form id="stream-init-form" method="POST" action="/stream_init" enctype="multipart/form-data" onsubmit="return initStream(event)">
+    <div class="form-group">
+      <label>레퍼런스 임베딩 (.npy)*</label>
+      <input type="file" name="ref_embedding" accept=".npy" required />
+    </div>
+    <div class="form-group">
+      <label>레퍼런스 랜드마크 (.npy)*</label>
+      <input type="file" name="ref_landmarks" accept=".npy" required />
+    </div>
+    <div class="form-group">
+      <label>레퍼런스 영상 (video)*</label>
+      <input type="file" name="ref_video" accept="video/*" required />
+    </div>
+    <button type="submit" class="btn">스트림 세션 생성</button>
+  </form>
+  <div id="stream-controls" style="display:none; margin-top:15px;">
+    <button class="btn" onclick="startStreaming()">웹캠 스트리밍 시작</button>
+    <button class="btn btn-secondary" onclick="stopStreaming()">중지</button>
+  </div>
+  <div style="margin-top:20px; display:flex; gap:20px; flex-wrap:wrap;">
+    <video id="localPreview" autoplay playsinline muted style="width:360px; background:#000; border-radius:8px"></video>
+    <img id="resultFrame" alt="Result" style="width:640px; background:#111; border-radius:8px" />
+  </div>
+</section>
+
+{% endblock %}
+
+{% block extra_js %}
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+<script>
+let socket = null;
+let sessionId = null;
+let mediaStream = null;
+let sendTimer = null;
+let canvas = null, ctx = null;
+
+async function initStream(ev){
+  ev.preventDefault();
+  const form = ev.target;
+  const fd = new FormData(form);
+  const resp = await fetch('/stream_init', { method:'POST', body: fd });
+  const js = await resp.json();
+  if(!js.ok){
+    alert('세션 생성 실패: ' + js.error);
+    return false;
+  }
+  sessionId = js.session_id;
+  document.getElementById('stream-controls').style.display='block';
+  alert('세션 생성 완료. 웹캠 스트리밍을 시작하세요.');
+  return false;
+}
+
+async function ensureMedia(){
+  if(mediaStream) return mediaStream;
+  mediaStream = await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
+  document.getElementById('localPreview').srcObject = mediaStream;
+  return mediaStream;
+}
+
+function connectSocket(){
+  return new Promise((resolve)=>{
+    socket = io();
+    socket.on('connect', resolve);
+    socket.on('stream_result', (payload)=>{
+      if(!payload || !payload.ok) return;
+      document.getElementById('resultFrame').src = payload.image;
+    });
+  });
+}
+
+async function startStreaming(){
+  if(!sessionId){ alert('먼저 세션을 생성하세요.'); return; }
+  await ensureMedia();
+  await connectSocket();
+  const track = mediaStream.getVideoTracks()[0];
+  if(!canvas){
+    canvas = document.createElement('canvas');
+    const s = track.getSettings ? track.getSettings() : {};
+    canvas.width = s.width || 640;
+    canvas.height = s.height || 480;
+    ctx = canvas.getContext('2d');
+  }
+  sendTimer = setInterval(()=>{
+    try {
+      ctx.drawImage(document.getElementById('localPreview'), 0,0, canvas.width, canvas.height);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.75);
+      if(socket && sessionId){
+        socket.emit('stream_frame', { session_id: sessionId, image: dataUrl });
+      }
+    } catch(e) {}
+  }, 1000/12); // 12fps
+}
+
+function stopStreaming(){
+  if(sendTimer){ clearInterval(sendTimer); sendTimer = null; }
+  if(socket){ socket.disconnect(); socket=null; }
+  if(mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; }
+  document.getElementById('localPreview').srcObject = null;
+}
+
+window.addEventListener('beforeunload', ()=> stopStreaming());
+</script>
+{% endblock %}
+
