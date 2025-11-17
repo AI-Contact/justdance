@@ -34,7 +34,8 @@ from flask import (
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from pipeline import compare_videos  # 실시간 웹소켓 처리 제거 → 추가 심볼 불필요
+# compare_videos는 사용하지 않으므로 임포트 제거
+# from pipeline import compare_videos
 
 # 기본 디렉터리 설정
 TEMP_DIR = Path(tempfile.gettempdir())
@@ -180,21 +181,20 @@ def index():
             rest_json_file.save(str(rest_json_path))
 
         if user_has_video and user_path is not None:
-            # 비교 모드
-            output_filename = f"{uuid.uuid4().hex}.mp4"
-            output_path = OUTPUT_DIR / output_filename
+            # 비교 모드: out_video 생성 없이 즉시 비교 화면(OpenCV 창) 표시
+            cmd = [
+                sys.executable,
+                str(demo_dir / "run_compare.py"),
+                "--ref", str(ref_path),
+                "--ref-lm", str(ref_lm_path),
+                "--user-video", str(user_path),
+                "--ref-video", str(ref_video_path),
+            ]
             try:
-                compare_videos(
-                    ref_path=str(ref_path),
-                    ref_lm_path=str(ref_lm_path),
-                    user_video=str(user_path),
-                    rest_json=str(rest_json_path) if rest_json_path else None,
-                    out_video=str(output_path),
-                )
+                subprocess.Popen(cmd)
             except Exception as exc:
-                flash(f"비교 수행 중 오류가 발생했습니다: {exc}", "error")
-                if output_path.exists():
-                    output_path.unlink(missing_ok=True)
+                flash(f"비교 세션 시작 실패: {exc}", "error")
+                # 업로드 정리(최소한의 롤백)
                 try:
                     for p in [ref_path, ref_lm_path, ref_video_path, user_path, rest_json_path]:
                         if p:
@@ -203,24 +203,10 @@ def index():
                 except Exception:
                     pass
                 return redirect(url_for("index"))
-            finally:
-                # 업로드 정리
-                try:
-                    for p in [ref_path, ref_lm_path, ref_video_path, user_path, rest_json_path]:
-                        if p:
-                            Path(p).unlink(missing_ok=True)
-                    req_dir.rmdir()
-                except Exception:
-                    pass
 
-            video_url = url_for("serve_output", filename=output_filename)
-            settings = {
-                "ref_path": ref_file.filename,
-                "ref_lm": ref_lm_file.filename,
-                "ref_video": ref_video_file.filename if ref_video_file and ref_video_file.filename else None,
-                "rest_json": rest_json_file.filename if rest_json_file and rest_json_file.filename else None,
-            }
-            return render_template("result.html", video_url=video_url, settings=settings, output_filename=output_filename)
+            flash("비교가 시작되었습니다. OpenCV 창에서 결과를 확인하세요 (종료: ESC/q)", "success")
+            # 업로드 파일은 비교 프로세스에서 사용하므로 즉시 삭제하지 않음(주기 정리에 맡김)
+            return redirect(url_for("index"))
         else:
             # 실시간 live_play 별도 프로세스 실행 (기본값 유지)
             cmd = [
