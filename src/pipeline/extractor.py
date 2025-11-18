@@ -12,14 +12,15 @@ import numpy as np
 
 
 class PoseExtractor:
-    def __init__(self, static_image_mode=False, model_complexity=1, enable_seg=False):
+    def __init__(self, static_image_mode=False, model_complexity=1, enable_seg=False,
+                 min_detection_confidence=0.5, min_tracking_confidence=0.5):
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(
             static_image_mode=static_image_mode,
             model_complexity=model_complexity,
             enable_segmentation=enable_seg,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=min_detection_confidence,
+            min_tracking_confidence=min_tracking_confidence
         )
     
     def infer(self, bgr):

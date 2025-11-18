@@ -6,11 +6,13 @@ import numpy as np
 import json, os
 from .pose_utils import BONES, ANGLE_TRIPLES
 
-# 영역별 기본 가중치(원하는 값으로 조정 가능)
+# 영역별 기본 가중치(원하는 값으로 조정 가능) - 왼쪽/오른쪽 구분
 REGION_WEIGHTS = {
-    "arm": 2.2,     # 팔
-    "leg": 2.4,     # 다리
-    "torso": 0.6,   # 몸통(어깨폭, 골반폭, 좌/우 연결 등)
+    "left arm": 2.2,    # 왼쪽 팔
+    "right arm": 2.2,   # 오른쪽 팔
+    "left leg": 2.4,    # 왼쪽 다리
+    "right leg": 2.4,   # 오른쪽 다리
+    "torso": 0.6,       # 몸통(어깨폭, 골반폭, 좌/우 연결 등)
 }
 ANGLE_WEIGHTS = {
     "left elbow": 0.5,
@@ -21,24 +23,45 @@ ANGLE_WEIGHTS = {
     "shoulder": 0.5,
 }
 REGION_COLORS = {
-    "arm":   (60, 180, 255),   # 주황톤
-    "leg":   (60, 255, 60),    # 연초록
-    "torso": (200, 200, 200),  # 회색
+    "left arm":   (255, 180, 60),   # 파란색 계열 (왼쪽 팔)
+    "right arm":  (60, 180, 255),   # 주황색 계열 (오른쪽 팔)
+    "left leg":   (60, 255, 60),    # 연초록 (왼쪽 다리)
+    "right leg":  (60, 255, 180),   # 민트색 (오른쪽 다리)
+    "torso":      (200, 200, 200),  # 회색 (몸통)
 }
 
 
-# BONES를 부위로 태깅(필요시 수정)
+# BONES를 부위로 태깅(필요시 수정) - 왼쪽/오른쪽 구분
 def _bone_region(i, j):
-    arms = {11,12,13,14,15,16}
-    legs = {23,24,25,26,27,28}
+    # 왼쪽 관절: 홀수 인덱스
+    left_arms = {11, 13, 15}   # L-SHOULDER, L-ELBOW, L-WRIST
+    right_arms = {12, 14, 16}  # R-SHOULDER, R-ELBOW, R-WRIST
+    left_legs = {23, 25, 27}   # L-HIP, L-KNEE, L-ANKLE
+    right_legs = {24, 26, 28}  # R-HIP, R-KNEE, R-ANKLE
+
     torso_pairs = {(11,12),(23,24),(11,23),(12,24)}
+
+    # Torso (몸통 연결)
     if (i,j) in torso_pairs or (j,i) in torso_pairs:
         return "torso"
-    if i in arms and j in arms:
-        return "arm"
-    if i in legs and j in legs:
-        return "leg"
-    # 팔↔몸통/다리↔몸통 연결은 중간값으로: 여기선 torso로 취급
+
+    # Left arm
+    if i in left_arms and j in left_arms:
+        return "left arm"
+
+    # Right arm
+    if i in right_arms and j in right_arms:
+        return "right arm"
+
+    # Left leg
+    if i in left_legs and j in left_legs:
+        return "left leg"
+
+    # Right leg
+    if i in right_legs and j in right_legs:
+        return "right leg"
+
+    # 팔↔몸통/다리↔몸통 연결은 torso로 취급
     return "torso"
 
 
@@ -56,7 +79,7 @@ def _angle_region(a,b,c):
     return "shoulder"
 
 
-def build_static_feature_weights_old(BONES, ANGLE_TRIPLES, lm_for_vis=None, vis_thresh=0.15):
+def build_static_feature_weights_old(BONES, ANGLE_TRIPLES, lm_for_vis=None, vis_thresh=0.5):
     """
     임베딩 순서:
       - BONES 개수 * 2 (각 뼈대의 (dx, dy) 단위벡터)

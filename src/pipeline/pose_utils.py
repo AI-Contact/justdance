@@ -145,7 +145,7 @@ def angle_feedback(curr_lm, ref_lm, angle_tol_deg=10.0):
     msgs = []
     for i, d in enumerate(diff_deg):
         if d > angle_tol_deg:
-            hint = "Jom deo peogi" if curr_angles[i] > ref_angles[i] else "Jeom deo gup"
+            hint = "Stretch" if curr_angles[i] > ref_angles[i] else "Bend"
             msgs.append(f"{ANGLE_NAMES[i]} {hint} (Difference {d:.1f}°)")
     return msgs
 

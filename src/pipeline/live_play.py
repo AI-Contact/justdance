@@ -341,9 +341,9 @@ def live_play(ref_path, ref_lm_path, camera=0, search_radius=0, ema_alpha=0.9, s
         avg_pct   = float(np.clip(avg_pct, 0.0, 100.0))
 
         grade_text, grade_color = "", (255,255,255)
-        if avg_pct >= 65:
+        if avg_pct >= 70:
             grade_text, grade_color = "PERFECT", (0,255,0)
-        elif avg_pct >= 60:
+        elif avg_pct >= 55:
             grade_text, grade_color = "GOOD", (0,200,255)
         else:
             grade_text, grade_color = "BAD", (255,0,0)
@@ -384,7 +384,7 @@ def live_play(ref_path, ref_lm_path, camera=0, search_radius=0, ema_alpha=0.9, s
         cv2.putText(combined, grade_text, (20, 90), font, 1.4, grade_color, 3, cv2.LINE_AA)
         y0 = 120
         for i, m in enumerate(last_feedback[:3]):
-            cv2.putText(combined, m, (20, y0 + i*30), font, 0.8, (0,200,255), 2, cv2.LINE_AA)
+            cv2.putText(combined, m, (20, y0 + i*30), font, 1.0, (0,200,255), 2, cv2.LINE_AA)
         cv2.putText(combined, f"pose={static_sim:+.2f}  motion={motion_sim:+.2f}  mag={motion_mag_match:.2f}",
                     (20, y0 + 3*30), font, 0.6, (200,200,200), 1, cv2.LINE_AA)
         if ref_cap is not None:

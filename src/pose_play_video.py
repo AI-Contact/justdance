@@ -34,7 +34,7 @@ if __name__ == "__main__":
         )
     else:
         live_play(
-            args.ref,
+            ref_path=args.ref,
             ref_lm_path=args.ref_lm,
             ref_video=args.ref_video,
         )

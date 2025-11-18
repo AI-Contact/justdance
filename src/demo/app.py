@@ -87,6 +87,8 @@ CONFIG = {
     # 포즈 추출 설정
     'POSE_MODEL_COMPLEXITY': 1,  # MediaPipe 모델 복잡도 (0: Lite, 1: Full, 2: Heavy)
     'STATIC_IMAGE_MODE': False,  # 정적 이미지 모드 (False: 비디오 모드)
+    'MIN_DETECTION_CONFIDENCE': 0.15,  # 포즈 감지 최소 확신도 (0.3으로 낮춰 옆모습 대응)
+    'MIN_TRACKING_CONFIDENCE': 0.15,   # 포즈 추적 최소 확신도 (0.3으로 낮춰 옆모습 대응)
 
     # 매칭 설정
     'SEARCH_RADIUS': 0,  # 온라인 매칭 검색 반경 (0: hint_idx만 사용)
@@ -147,6 +149,7 @@ active_session = {
     'session_ended': False,  # 세션 종료 여부
     'end_time': 0.0,         # 세션 종료 시간
     'is_rest': False,        # 현재 REST 구간 여부
+    'is_last_rest': False,   # 마지막 REST 구간 여부
     'frame_buffer': None,  # 최신 합성 프레임
     'lock': threading.Lock(),
 }
@@ -164,10 +167,28 @@ def _save(fs, d: Path) -> Path:
     fs.save(str(p))
     return p
 
+def _fix_rotation(frame):
+    """프레임 회전 자동 보정 (세로 영상을 가로로 변환)"""
+    if frame is None:
+        return frame
+
+    h, w = frame.shape[:2]
+
+    # 세로 영상인 경우 (높이 > 너비) 90도 회전
+    if h > w:
+        # 시계 반대방향 90도 회전 (ROTATE_90_COUNTERCLOCKWISE)
+        frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    return frame
+
 def _combine(left, right):
     """좌우 프레임 합성"""
     if right is None:
         return left
+
+    # 레퍼런스 프레임 회전 보정
+    right = _fix_rotation(right)
+
     h, w = left.shape[:2]
     rh, rw = right.shape[:2]
     if rh != h:
@@ -221,6 +242,7 @@ def init_session(ref_path: str, ref_lm_path: str, ref_video_path: str):
             # weights.json 경로를 명시적으로 지정 (작업 디렉토리 변경으로 인한 문제 방지)
             weights_json_path = str(SRC_DIR / 'data' / 'weights.json')
             region_w, angle_w = load_weights_for_video(ref_video_path, weights_json_path)
+
         except Exception as e:
             print(f"[Warning] Failed to load weights for {os.path.basename(ref_video_path)}: {e}")
             region_w, angle_w = None, None
@@ -248,7 +270,9 @@ def init_session(ref_path: str, ref_lm_path: str, ref_video_path: str):
             'angle_w': angle_w,
             'pe': PoseExtractor(
                 static_image_mode=CONFIG['STATIC_IMAGE_MODE'],
-                model_complexity=CONFIG['POSE_MODEL_COMPLEXITY']
+                model_complexity=CONFIG['POSE_MODEL_COMPLEXITY'],
+                min_detection_confidence=CONFIG['MIN_DETECTION_CONFIDENCE'],
+                min_tracking_confidence=CONFIG['MIN_TRACKING_CONFIDENCE']
             ),
             'matcher': OnlineMatcher(ref),
             'prev_live_emb': None,
@@ -270,6 +294,7 @@ def init_session(ref_path: str, ref_lm_path: str, ref_video_path: str):
             'session_ended': False,
             'end_time': 0.0,
             'is_rest': False,
+            'is_last_rest': False,
             'frame_buffer': None,
         })
 
@@ -418,8 +443,23 @@ def generate_frames():
 
         # REST 구간
         if in_intervals(hint_idx, rest_intervals):
+            # 마지막 REST 구간인지 확인
+            is_last_rest = False
+            if rest_intervals:
+                # rest_intervals를 시간 순서로 정렬하여 마지막 구간 찾기
+                sorted_intervals = sorted(rest_intervals, key=lambda x: x[0])
+                last_rest_start, last_rest_end = sorted_intervals[-1]
+
+                # 현재 hint_idx가 마지막 REST 구간 내에 있는지 확인
+                if last_rest_start <= hint_idx <= last_rest_end:
+                    is_last_rest = True
+                    #print(f"[DEBUG] Last REST detected! hint_idx={hint_idx}, last_rest=({last_rest_start}, {last_rest_end})")
+                #else:
+                    #print(f"[DEBUG] Regular REST. hint_idx={hint_idx}, current_rest_intervals={rest_intervals}")
+
             with active_session['lock']:
                 active_session['is_rest'] = True
+                active_session['is_last_rest'] = is_last_rest
                 ok_ref, ref_frame, active_session['ref_frame_cur'] = read_frame_at(
                     ref_cap, hint_idx * ref_stride, active_session['ref_frame_cur']
                 )
@@ -429,6 +469,7 @@ def generate_frames():
         else:
             with active_session['lock']:
                 active_session['is_rest'] = False
+                active_session['is_last_rest'] = False
 
             # 레퍼런스 프레임 먼저 가져오기
             with active_session['lock']:
@@ -477,6 +518,7 @@ def generate_frames():
                         w_feat = build_static_feature_weights(BONES, ANGLE_TRIPLES, lm_for_vis=None)[0]
 
                     # 점수 계산
+                    #print(f"[DEBUG] weights: {w_feat}")
                     static_sim = weighted_cosine(matcher.ref[ref_idx], emb, w_feat)
                     ref_emb = matcher.ref[ref_idx]
 
@@ -536,9 +578,9 @@ def generate_frames():
                                 avg_score = np.mean([score for t, score in active_session['grade_history']])
 
                                 # 평균 점수로 등급 판정
-                                if avg_score >= 65.0:
+                                if avg_score >= 70.0:
                                     final_grade = 'PERFECT'
-                                elif avg_score >= 60.0:
+                                elif avg_score >= 55.0:
                                     final_grade = 'GOOD'
                                 else:
                                     final_grade = 'BAD'
@@ -677,6 +719,7 @@ def get_status():
             'is_warmup': is_warmup,
             'warmup_remaining': warmup_remaining,
             'is_rest': active_session['is_rest'],
+            'is_last_rest': active_session.get('is_last_rest', False),
             'grade_counts': active_session['grade_counts'],
             'graded_total': active_session['graded_total'],
             'current_grade': active_session['current_grade'],
