@@ -132,7 +132,7 @@ active_session = {
     'matcher': None,
     'prev_live_emb': None,
     'prev_ref_emb': None,
-    'score_ema': 0.5,  # 초기값을 중간 점수로 설정 (0.5 = 50점 원본, 정규화 후 0점)
+    'score_ema': 1.0,  # 초기값을 중간 점수로 설정 (0.5 = 50점 원본, 정규화 후 0점)
     'feedback': [],
     'ref_frame_cur': 0,
     'start_t': 0.0,
@@ -150,6 +150,7 @@ active_session = {
     'end_time': 0.0,         # 세션 종료 시간
     'is_rest': False,        # 현재 REST 구간 여부
     'is_last_rest': False,   # 마지막 REST 구간 여부
+    'was_in_rest': False,    # 이전 프레임에서 REST 상태였는지 (REST 종료 감지용)
     'frame_buffer': None,  # 최신 합성 프레임
     'lock': threading.Lock(),
 }
@@ -277,7 +278,7 @@ def init_session(ref_path: str, ref_lm_path: str, ref_video_path: str):
             'matcher': OnlineMatcher(ref),
             'prev_live_emb': None,
             'prev_ref_emb': None,
-            'score_ema': 0.5,  # 초기값을 중간 점수로 설정 (0.5 = 50점 원본, 정규화 후 0점)
+            'score_ema': 1.0,  # 초기값을 중간 점수로 설정 (0.5 = 50점 원본, 정규화 후 0점)
             'feedback': [],
             'ref_frame_cur': 0,
             'start_t': time.perf_counter(),
@@ -295,6 +296,7 @@ def init_session(ref_path: str, ref_lm_path: str, ref_video_path: str):
             'end_time': 0.0,
             'is_rest': False,
             'is_last_rest': False,
+            'was_in_rest': False,
             'frame_buffer': None,
         })
 
@@ -441,8 +443,26 @@ def generate_frames():
             draw_colored_skeleton(overlay, arr)
             display_left = cv2.addWeighted(overlay, 0.5, display_left, 0.5, 0)
 
+        # REST 구간 종료 감지 및 초기화 (REST → 운동 구간으로 전환 시)
+        current_is_rest = in_intervals(hint_idx, rest_intervals)
+
+        with active_session['lock']:
+            was_in_rest = active_session['was_in_rest']
+
+            # REST 구간에서 운동 구간으로 전환된 경우 (REST 종료)
+            if was_in_rest and not current_is_rest:
+                # 등급 평가 시스템 초기화
+                active_session['last_grade_time'] = elapsed  # 현재 시점에서 3초 재시작
+                active_session['grade_history'] = []  # score_window 초기화
+                active_session['current_grade'] = None  # 현재 등급 초기화
+                active_session['grade_timestamp'] = 0.0  # 등급 표시 시간 초기화
+                active_session['score_ema'] = 1.0  # 현재 점수를 1.0으로 초기화
+
+            # 현재 REST 상태 업데이트
+            active_session['was_in_rest'] = current_is_rest
+
         # REST 구간
-        if in_intervals(hint_idx, rest_intervals):
+        if current_is_rest:
             # 마지막 REST 구간인지 확인
             is_last_rest = False
             if rest_intervals:
@@ -481,28 +501,15 @@ def generate_frames():
 
             # 포즈 분석 및 점수 계산 (포즈가 감지되었을 때만)
             if arr is not None:
-                # 디버깅: visibility 확인
-                avg_vis = np.mean(arr[:, 3])
-                critical_joints = [11, 12, 23, 24, 13, 14, 25, 26]
-                critical_vis = np.mean([arr[i, 3] for i in critical_joints if i < len(arr)])
-
-                # 매우 낮은 visibility 체크 (옆모습 디버깅용)
-                if critical_vis < 0.25:
-                    print(f"[DEBUG] Low visibility detected - avg: {avg_vis:.2f}, critical: {critical_vis:.2f}")
-
                 lm = normalize_landmarks(arr.copy())
                 emb = pose_embedding(lm)
 
                 # 임베딩에 유효한 값이 있는지 확인
                 valid_ratio = np.sum(np.abs(emb) > 1e-6) / len(emb)
                 if valid_ratio < 0.15:  # 0.3 → 0.15로 낮춤 (옆모습 대응)
-                    print(f"[DEBUG] Very low valid embedding ratio: {valid_ratio:.2f}, skipping score calculation")
                     # 유효한 임베딩이 너무 적으면 점수 계산 스킵
                     combined = _combine(display_left, display_right)
                 else:
-                    # 옆모습 디버깅: 유효 임베딩 비율 출력
-                    if valid_ratio < 0.3:
-                        print(f"[DEBUG] Low but acceptable embedding ratio: {valid_ratio:.2f}, proceeding with score calculation")
                     _, ref_idx = matcher.step_with_hint(emb, hint_idx=hint_idx, search_radius=CONFIG['SEARCH_RADIUS'])
 
                     # 가중치
@@ -552,49 +559,49 @@ def generate_frames():
                         except Exception:
                             pass
 
-                    # 점수/등급 계산 (포즈가 감지되었을 때만 히스토리에 추가)
-                    with active_session['lock']:
-                        # 현재 점수 정규화 (50~95 -> 0~100)
-                        score_50_95 = active_session['score_ema'] * 100.0
-                        normalized_score = ((score_50_95 - 50.0) / 45.0) * 100.0
-                        normalized_score = float(np.clip(normalized_score, 0.0, 100.0))
+                    # 점수/등급 계산 (포즈가 감지되고 REST 구간이 아닐 때만 히스토리에 추가)
+                    if not active_session['is_rest']:
+                        with active_session['lock']:
+                            # 현재 점수 정규화 (50~95 -> 0~100)
+                            score_50_95 = active_session['score_ema'] * 100.0
+                            normalized_score = ((score_50_95 - 50.0) / 45.0) * 100.0
+                            normalized_score = float(np.clip(normalized_score, 0.0, 100.0))
 
-                        current_time = time.time()
+                            current_time = time.time()
 
-                        # 매 프레임마다 정규화된 점수를 히스토리에 추가
-                        active_session['grade_history'].append((current_time, normalized_score))
+                            # 매 프레임마다 정규화된 점수를 히스토리에 추가
+                            active_session['grade_history'].append((current_time, normalized_score))
 
-                        # 3초보다 오래된 히스토리 제거
-                        grade_interval = 3.0
-                        cutoff_time = current_time - grade_interval
-                        active_session['grade_history'] = [
-                            (t, score) for t, score in active_session['grade_history'] if t > cutoff_time
-                        ]
+                            # 3초보다 오래된 히스토리 제거
+                            grade_interval = 3.0
+                            cutoff_time = current_time - grade_interval
+                            active_session['grade_history'] = [
+                                (t, score) for t, score in active_session['grade_history'] if t > cutoff_time
+                            ]
 
-                        # 3초마다 한 번씩만 등급 평가
-                        if elapsed - active_session['last_grade_time'] >= grade_interval:
-                            # 3초 동안의 점수 히스토리에서 평균 점수 계산
-                            if active_session['grade_history']:
-                                avg_score = np.mean([score for t, score in active_session['grade_history']])
+                            # 3초마다 한 번씩만 등급 평가
+                            if elapsed - active_session['last_grade_time'] >= grade_interval:
+                                # 3초 동안의 점수 히스토리에서 평균 점수 계산
+                                if active_session['grade_history']:
+                                    avg_score = np.mean([score for t, score in active_session['grade_history']])
 
-                                # 평균 점수로 등급 판정
-                                if avg_score >= 70.0:
-                                    final_grade = 'PERFECT'
-                                elif avg_score >= 55.0:
-                                    final_grade = 'GOOD'
-                                else:
-                                    final_grade = 'BAD'
+                                    # 평균 점수로 등급 판정
+                                    if avg_score >= 65.0:
+                                        final_grade = 'PERFECT'
+                                    elif avg_score >= 53.0:
+                                        final_grade = 'GOOD'
+                                    else:
+                                        final_grade = 'BAD'
 
-                                active_session['grade_counts'][final_grade] += 1
-                                active_session['graded_total'] += 1
-                                active_session['last_grade_time'] = elapsed
-                                active_session['current_grade'] = final_grade
-                                active_session['grade_timestamp'] = current_time
-                                # 히스토리 클리어 (새로운 3초 시작)
-                                active_session['grade_history'] = []
+                                    active_session['grade_counts'][final_grade] += 1
+                                    active_session['graded_total'] += 1
+                                    active_session['last_grade_time'] = elapsed
+                                    active_session['current_grade'] = final_grade
+                                    active_session['grade_timestamp'] = current_time
+                                    # 히스토리 클리어 (새로운 3초 시작)
+                                    active_session['grade_history'] = []
             else:
                 # 포즈가 감지되지 않은 경우
-                print("[DEBUG] No pose detected (arr is None)")
                 combined = _combine(display_left, display_right)
 
 
